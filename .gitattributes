@@ -1,0 +1,7 @@
+# 统一用 LF，避免 Windows autocrlf 把 userscript 换行改掉
+* text=auto eol=lf
+
+*.user.js text eol=lf
+*.js       text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
