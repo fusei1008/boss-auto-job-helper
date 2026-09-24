@@ -1,13 +1,12 @@
 // ==UserScript==
-// @name         BOSS 直聘求职助手 (通用版·低频防封)
-// @name:en      BOSS Zhipin Auto Job Helper (Universal)
-// @namespace    boss-auto-job-helper
-// @version      2.0.0
-// @description  通用版求职自动助手，不限专业方向：超低频真人慢速巡检、薪资字体自动解密、详情深度核验、沟通结果确认、平台上限/风控识别，内置互联网/算法/硬件/机械/生物医药/财务/销售/职能/设计/供应链/教育等方向预设，关键词与招呼语完全可自定义。
+// @name         BOSS 直聘全自动求职助手 (Jev 深度研判·智能低频防封版)
+// @namespace    local.boss-auto-helper
+// @version      1.6.0
+// @description  基于 TypeSafe Jev 多维正交语义深度研判与战略择优投递。支持真研发深度量化、外包与培训陷阱拦截、资历层级校验与超低频真人慢速巡检。
 // @author       niz
 // @license      MIT
-// @homepageURL  https://github.com/YOUR_GITHUB_USERNAME/boss-auto-job-helper
-// @supportURL   https://github.com/YOUR_GITHUB_USERNAME/boss-auto-job-helper/issues
+// @homepageURL  https://github.com/fusei1008/boss-auto-job-helper
+// @supportURL   https://github.com/fusei1008/boss-auto-job-helper/issues
 // @match        https://zhipin.com/*
 // @match        https://*.zhipin.com/*
 // @run-at       document-idle
@@ -15,16 +14,10 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @connect      api.typesafe.ai
+// @connect      openrouter.ai
 // ==/UserScript==
-
-/*
- * 参考与致谢（均为 MIT 许可，详见 README 的「参考与致谢」一节）：
- *   - Ocyss/boss-helper              浏览器端自动化方案的整体形态
- *   - eatmoreduck/boss-zhipin-scraper 前端字体反爬（薪资加密）的识别与还原思路
- *   - xirichuyi/boss-job-agent        「不绕过扫码/人机验证/平台限制」的边界设定
- *   - longsizhuo/BossZhiPin_Job_Search 招呼语模板化 + 发送前规则审核
- *   - can4hou6joeng4/boss-agent-cli   结构化输出与结果确认
- */
 
 (function () {
   "use strict";
@@ -34,15 +27,26 @@
 
   const PANEL_ID = "boss-auto-helper-panel";
   const STYLE_ID = "boss-auto-helper-style";
-  const SETTINGS_VERSION = "v2.0.0";
+  const SETTINGS_VERSION = "v1.5.0";
 
-  const MIN_INTERVAL_SEC = 20;          // 单次投递间隔的硬下限（秒）
-  const MAX_VISITED = 2500;             // 已阅岗位缓存上限
-  const MAX_LOGS = 100;                 // 日志保留条数
-  const MAX_CONSECUTIVE_FAILURES = 5;   // 连续异常达到此值自动暂停
-  const MAX_EMPTY_LOAD_ROUNDS = 6;      // 连续拉取都没有新岗位时停止
-  const DETAIL_TIMEOUT_MS = 6000;       // 等待右侧详情切换的最长时间
-  const CONFIRM_TIMEOUT_MS = 8000;      // 点击沟通后等待平台反馈的最长时间
+  // 单次投递间隔的硬下限（秒）
+  const MIN_INTERVAL_SEC = 20;
+  // 已阅岗位缓存上限
+  const MAX_VISITED = 2500;
+  // 日志保留条数
+  const MAX_LOGS = 100;
+  // 连续异常达到此值自动暂停
+  const MAX_CONSECUTIVE_FAILURES = 5;
+  // 连续拉取都没有新岗位时停止
+  const MAX_EMPTY_LOAD_ROUNDS = 6;
+  // 等待右侧详情切换的最长时间
+  const DETAIL_TIMEOUT_MS = 6000;
+  // 点击沟通后等待平台反馈的最长时间
+  const CONFIRM_TIMEOUT_MS = 8000;
+  // Jev 决策记录保留条数
+  const MAX_JEV_DECISIONS = 300;
+  // Jev 连续调用失败达到此值自动暂停（绝不降级为纯规则投递）
+  const MAX_JEV_FAILURES = 3;
 
   const STORAGE_KEYS = {
     settings: "bossAutoHelper.settings",
@@ -50,7 +54,9 @@
     visited: "bossAutoHelper.visitedJobs",
     logs: "bossAutoHelper.logs",
     pending: "bossAutoHelper.pendingContact",
-    applied: "bossAutoHelper.appliedCompanies"
+    applied: "bossAutoHelper.appliedCompanies",
+    jevDecisions: "bossAutoHelper.jevDecisions",
+    jevApiKey: "TYPESAFE_API_KEY"
   };
 
   // 必须在 state 初始化之前求值：loadSettings/loadStats 都会经过 storeGet
@@ -67,6 +73,8 @@
     salary: ".job-salary, [class*='salary']",
     tags: [".tag-list li", ".job-card-footer li", "[class*='tag']"],
     detail: [".job-detail-box", ".job-detail-body", ".job-detail", "[class*='job-detail']", ".detail-content", ".job-sec-text"],
+    // 详情面板里的纯职位描述正文（不含按钮、BOSS 信息、公司介绍）
+    jdText: ".job-sec-text",
     contactButton: ".op-btn-chat, .btn-startchat, [class*='btn-chat'], [class*='op-btn'], a, button",
     dialog: ".dialog-wrap, .boss-popup__wrapper, .boss-dialog, [role='dialog'], .verify-slider, .geetest_panel",
     anyButton: "button, a, .btn, [class*='btn']",
@@ -75,149 +83,80 @@
     pagerNext: "a, button, [class*='next'], [class*='arrow-right']"
   };
 
-  // ========================== 方向预设库 ==========================
-  // 每个预设包含：名称 / 包含关键词 / 排除关键词 / 招呼语 / 最低月薪(K)
-  // 招呼语支持占位符：{company} {title}（也可写 {公司} {岗位}）
-  // 想新增方向？照着下面任意一条复制一份，改 key 和内容即可，面板下拉框会自动出现。
-
-  // 通用排除词：各方向共用。命中即跳过，主要用于滤掉纯销售/电销/流水线等无效岗位。
-  const COMMON_EXCLUDE = "销售, 电销, 电话销售, 微信销售, 网络销售, 地推, 招商, 渠道, 猎头, 保险, 催收, 房产, 中介, 客服, 普工, 兼职, 日结, 小时工, 劳务派遣, 操作工, 包装工, 产线流水线, 车间工人, 学徒";
-
-  // 兜底招呼语：所有预设都可自行改写，面板里也能直接编辑
-  const DEFAULT_GREETING = "您好！我对贵司的「{title}」岗位很感兴趣，我的经历与该岗位的要求比较匹配。方便的话想进一步沟通，期待您的回复！";
-
+  // 预设配置库：支持一键在前端快速切换
   const PRESETS = {
-    tech: {
-      name: "💻 互联网 / 软件研发",
-      includeKeywords: "Java, Golang, Go语言, Python, PHP, C++, C#, C语言, 前端, 后端, 全栈, Web前端, 服务端, 客户端, Android, iOS, 鸿蒙, 小程序, 软件工程师, 软件开发, 开发工程师, 测试开发, 软件测试, 自动化测试, 运维, 运维开发, SRE, DevOps, 架构师, 微服务, 分布式, 云原生, Kubernetes, Docker, 数据库, DBA, 网络安全, 安全工程师, 音视频开发, 图形开发, 游戏开发, Unity, 虚幻, UE4, UE5, 嵌入式软件",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我的技术栈与岗位要求比较匹配，也做过同类项目。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 8
-    },
-    ai_data: {
-      name: "🤖 算法 / AI / 大数据",
-      includeKeywords: "算法, 算法工程师, 机器学习, 深度学习, 大模型, LLM, NLP, 自然语言处理, 计算机视觉, 推荐算法, 搜索算法, 广告算法, 数据挖掘, 数据科学, 数据分析, 数据开发, 数据仓库, 数据平台, 大数据, 数据工程, 商业分析, 量化, 强化学习, 多模态, AIGC, 语音识别, 图像算法, 感知算法, 自动驾驶算法",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我在数据处理与算法建模方面有相关经验，与该岗位方向比较匹配。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 10
-    },
-    hardware: {
-      name: "🔌 电子 / 硬件 / 嵌入式",
-      includeKeywords: "硬件工程师, 硬件开发, 嵌入式, 单片机, MCU, ARM, FPGA, DSP, PCB, 电路设计, 模拟电路, 数字电路, 射频, 天线, 电源工程师, 驱动开发, 固件, 电气工程师, 自动化工程师, 仪器仪表, 传感器, 芯片设计, IC设计, 版图, 验证工程师, EMC",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我在硬件/嵌入式方向有相关项目经验，与该岗位要求比较匹配。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 7
-    },
-    mech: {
-      name: "⚙️ 机械 / 制造 / 工艺",
-      includeKeywords: "机械设计, 机械工程师, 结构设计, 结构工程师, 工艺工程师, 制程工程师, 模具, 非标自动化, 夹具, 设备工程师, 生产管理, 生产主管, 质量管理, 质量工程师, 精益生产, IE工程师, 工业工程, 材料工程师, 焊接, 数控, CNC, 钣金, 注塑, 热处理, 装配",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我在机械/工艺方向有相关经验，踏实肯干，与该岗位要求比较匹配。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 6
-    },
     bio_rd: {
-      name: "🧬 生物医药 / 化工研发",
+      name: "🧬 生物研发(分子/合成生物/蛋白/抗体/多肽)",
+      candidateProfile: "求职意向：生物研发工程师、分子生物研究员、蛋白纯化/表达研发助理。\n学历与技能：生物学/生物工程相关硕士或优秀本科。精通分子克隆、质粒构建、重组蛋白表达与纯化（AKTA/FPLC）、抗体工程、噬菌体展示或多肽合成，具备严谨扎实的实验与记录功底。\n核心偏好：正规生物医药企业或研发机构的研发主业。\n绝对排除：劳务派遣外包、医药电话销售、医药招商、动物房日常清洗打杂、纯流水线车间操作工。",
       includeKeywords: "分子生物, 合成生物, 重组蛋白, 蛋白纯化, 蛋白表达, 多肽, 环肽, 噬菌体, 噬菌体展示, 抗体, 抗体工程, 酶催化, 载体构建, 质粒构建, 基因克隆, FPLC, AKTA, 生物淘选, 生物合成, 生化研发, 蛋白工程, 分子克隆, 表达纯化, 纯化表征, 研发研究员, 研发工程师, 生物研发, 科研助理, 研发助理",
-      excludeKeywords: COMMON_EXCLUDE + ", 临床协调, CRA, CRC, 招投标, 采购, 申报专员, 饲养员",
-      greetingText: "您好！看到贵司正在招聘「{title}」，与我的研发经历高度匹配。希望能向您呈递详细简历并深入沟通！",
-      minSalaryK: 7
+      excludeKeywords: "销售, 电销, 电话销售, 微信销售, 网络销售, 社群, 推广, 地推, 客服, 招商, 顾问, 渠道, 商务拓展, 猎头, 保险, 催收, 房产, 普工, 兼职, 劳务派遣, 操作工, 包装工, 产线流水线, 车间工人, 动物房饲养员, 饲养员, 临床协调, CRA, CRC, 招投标, 采购, 申报专员",
+      greetingText: "您好！我是xxx。看到贵司正在招聘此岗位，与我的研发经历高度匹配。希望能向您呈递详细简历并深入沟通！",
+      minSalaryK: 7,
+      jevMinDepth: 1.0
     },
-    bioinfo: {
-      name: "🧫 生信分析 / 计算生物",
-      includeKeywords: "生信, 生信分析, 生信工程师, 计算生物, 计算化学, AI研究助理, AI助理, 结构生物, 分子模拟, 分子对接, 药物设计, 机器学习, Python, 科研助理, 研发助理",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对「{title}」岗位非常感兴趣。我在科研中熟练使用 Python 进行数据挖掘、序列/结构建模与自动化分析，熟悉各类 AI 辅助科研工具。希望能向您呈递详细简历并进一步沟通！",
-      minSalaryK: 8
+    bioinfo_ai: {
+      name: "💻 生信分析/AI科研助理/计算生物",
+      candidateProfile: "求职意向：生信分析工程师、AI科研助理、计算生物研究员。\n学历与技能：生物信息学/计算生物学/计算机/生物技术专业背景。精通使用 Python/R 开展组学数据挖掘、NGS 二代/三代高通量测序流程搭建、单细胞分析、分子对接、蛋白质结构预测（AlphaFold）或机器学习建模。\n核心偏好：具有真正数据挖掘与前沿流程搭建价值的核心技术岗位。\n绝对排除：中介外包派遣、低端数据录入、非技术性IT网管运维、挂名销售、转岗培训机构。",
+      includeKeywords: "生信, 生信分析, 生信工程师, 计算生物, 计算化学, AI研究助理, AI助理, 数据分析, Python, 算法, 结构生物, 分子模拟, 分子对接, 药物设计, 机器学习, 科研助理, 研发助理",
+      excludeKeywords: "销售, 电销, 客服, 招商, 普工, 操作工, 包装工, 产线流水线, 劳务派遣, 兼职",
+      greetingText: "您好！我对该岗位非常感兴趣。我是xxx,在科研中熟练使用Python进行生物数据挖掘、序列/结构建模与自动化分析，熟悉各类AI辅助科研工具。希望能向您呈递详细简历并进一步沟通！",
+      minSalaryK: 8,
+      jevMinDepth: 1.0
     },
     qc_analysis: {
-      name: "🧪 质检 / 分析检测",
-      includeKeywords: "分析检测, 质检, QA, QC, 理化检验, 检验员, 实验员, 化验员, 仪器分析, 色谱分析, HPLC, 质谱分析, 食品检验, 材料检测, 无损检测, 计量, 校准, 研发助理, 助理工程师",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣。我具备扎实的实验操作、仪器分析（HPLC/质谱等）与数据处理能力，踏实严谨。希望能向您呈递详细简历并进一步交流！",
-      minSalaryK: 6
-    },
-    finance: {
-      name: "📊 财务 / 审计 / 金融",
-      includeKeywords: "会计, 财务, 财务分析, 财务BP, 审计, 税务, 出纳, 成本会计, 总账, 资金管理, 风控, 合规, 投资, 投研, 证券, 基金, 银行, 信贷, 保险精算, 量化研究",
-      excludeKeywords: "电销, 电话销售, 网络销售, 地推, 招商, 猎头, 保险销售, 保险代理, 催收, 房产, 中介, 客服, 普工, 兼职, 日结, 小时工, 劳务派遣, 操作工, 包装工, 产线流水线",
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我在财务/金融相关方向有相应经验，做事细致严谨。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 6
-    },
-    sales_mkt: {
-      name: "📣 销售 / 市场 / 运营",
-      includeKeywords: "销售, 大客户, 渠道, 商务拓展, 市场, 品牌, 市场营销, 运营, 用户运营, 内容运营, 新媒体运营, 电商运营, 活动运营, 产品运营, 社群运营, 增长, 推广, 媒介, 公关, 广告, 客户成功, 售后",
-      excludeKeywords: "催收, 保险代理, 房产中介, 客服, 普工, 兼职, 日结, 小时工, 劳务派遣, 操作工, 包装工, 产线流水线",
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我有相关的客户开拓与成单经验，抗压能力强。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 0
-    },
-    hr_admin: {
-      name: "🧑‍💼 人力 / 行政 / 职能",
-      includeKeywords: "招聘, 人力资源, HR, HRBP, 人事, 薪酬绩效, 培训, 组织发展, 行政, 总裁助理, 总经理助理, 法务, 律师, 知识产权, 专利, 内控, 战略, 投资者关系",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我在职能/人力相关方向有相应经验，沟通协调能力较强。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 5
-    },
-    design: {
-      name: "🎨 设计 / 创意",
-      includeKeywords: "UI设计, UX, 交互设计, 视觉设计, 平面设计, 电商设计, 工业设计, 产品设计, 3D设计, 动画设计, 游戏美术, 原画, 插画, 视频剪辑, 影视后期, 摄影师, 品牌设计, 包装设计, 室内设计, 景观设计, 建筑设计",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我熟悉完整的设计流程，可随时提供作品集。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 6
-    },
-    supply: {
-      name: "📦 供应链 / 采购 / 物流",
-      includeKeywords: "采购, 供应链, 物流, 仓储, 库存, 计划员, 生产计划, 物料, 关务, 报关, 外贸, 单证, 跟单, 品质, 供应商管理, SQE, 配送, 运输",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我在采购/供应链方向有相应经验，熟悉业务流程与供应商管理。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 6
-    },
-    edu: {
-      name: "🎓 教育 / 教师 / 教研",
-      includeKeywords: "教师, 老师, 讲师, 教研, 助教, 课程顾问, 培训师, 教务, 班主任, 早教, 幼教, 留学顾问",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: "您好！我对贵司的「{title}」岗位很感兴趣，我有教学/教研相关经验，善于沟通与表达。方便的话想进一步沟通，期待您的回复！",
-      minSalaryK: 5
-    },
-    general: {
-      name: "🌐 通用（不限定方向，仅按排除词过滤）",
-      includeKeywords: "",
-      excludeKeywords: COMMON_EXCLUDE,
-      greetingText: DEFAULT_GREETING,
-      minSalaryK: 0
+      name: "🧪 分析检测/质检/理化实验",
+      candidateProfile: "求职意向：QC理化分析员、分析检测工程师、实验员、助理工程师。\n学历与技能：分析化学/药物分析/生物医药专业。精通高效液相色谱（HPLC）、气相色谱（GC）、质谱分析等仪器操作与方法验证，严格遵循 GMP/GLP 规范。\n核心偏好：规范仪器分析与研发质检岗位。\n绝对排除：车间纯体力包装搬运工、无仪器操作的简单巡检、电话客服、劳务中介派遣。",
+      includeKeywords: "分析检测, 质检, QA, QC, 理化检验, 检验员, 实验员, 化验员, 仪器分析, 色谱分析, HPLC, 质谱分析, 研发助理, 助理工程师",
+      excludeKeywords: "销售, 电销, 客服, 招商, 普工, 兼职, 劳务派遣, 操作工, 包装工, 产线流水线",
+      greetingText: "您好！我对贵司该岗位很感兴趣。我是xx，具备扎实的实验操作、分析检测（HPLC/质谱）与数据分析能力，踏实严谨。希望能向您呈递详细简历并进一步交流！",
+      minSalaryK: 6,
+      // QC 岗天然处在"按 SOP 执行"这一级（深度约 1），门槛放低一点
+      jevMinDepth: 0.7
     }
   };
-
-  // 默认使用的预设（用户可在面板下拉框中一键切换）
-  const DEFAULT_PRESET_KEY = "tech";
-
-  // 把招呼语里的占位符替换成当前岗位的真实信息
-  function renderGreeting(text) {
-    const tpl = String(text || "");
-    if (!tpl) return "";
-    return tpl
-      .replace(/\{company\}|\{公司\}/g, state.currentCompany || "")
-      .replace(/\{title\}|\{岗位\}/g, state.currentTitle || "")
-      .trim();
-  }
 
   // 默认配置
   const DEFAULT_SETTINGS = {
     version: SETTINGS_VERSION,
-    intervalMin: 45,           // 最小安全投递间隔 45 秒 (慢速低频)
-    intervalMax: 90,           // 最大安全投递间隔 90 秒 (慢速低频，不给平台造成压力)
-    dailyMax: 40,              // 每日低频适度上限 (建议 30-50，安全稳定)
-    presetKey: DEFAULT_PRESET_KEY, // 面板下拉框当前选中的方向预设
-    minSalaryK: PRESETS[DEFAULT_PRESET_KEY].minSalaryK,
-    excludeInternships: true,  // 自动排除实习生岗位
-    autoSendGreeting: true,    // 页面弹出可编辑输入框时，自动填入并发送定制介绍
-    greetingText: PRESETS[DEFAULT_PRESET_KEY].greetingText,
-    includeKeywords: PRESETS[DEFAULT_PRESET_KEY].includeKeywords,
-    excludeKeywords: PRESETS[DEFAULT_PRESET_KEY].excludeKeywords,
+    // 最小安全投递间隔 45 秒 (慢速低频)
+    intervalMin: 45,
+    // 最大安全投递间隔 90 秒 (慢速低频，不给平台造成压力)
+    intervalMax: 90,
+    // 每日低频适度上限 (建议 30-50，安全稳定)
+    dailyMax: 40,
+    minSalaryK: PRESETS.bio_rd.minSalaryK,
+    // 自动排除实习生岗位
+    excludeInternships: true,
+    // 卡片标签要求的最低经验年限 ≥ 此值时跳过（0 表示不限；应届生建议 3，即跳过 3-5年 及以上）
+    maxExpYears: 3,
+    // 跳过学历标签为博士的岗位
+    skipPhdJobs: true,
+    // 尊重 BOSS 原生机制：点击立即沟通由平台原生发出官方打招呼
+    autoSendGreeting: false,
+    greetingText: PRESETS.bio_rd.greetingText,
+    includeKeywords: PRESETS.bio_rd.includeKeywords,
+    excludeKeywords: PRESETS.bio_rd.excludeKeywords,
     panelCollapsed: false,
     panelHidden: false,
     panelX: null,
-    panelY: null
+    panelY: null,
+    // Jev 智能研判深度配置
+    jevEnabled: true,
+    jevApiKey: "",
+    candidateProfile: PRESETS.bio_rd.candidateProfile,
+    // 最低研发深度门槛 (0~2，低于此值视为低端打杂)
+    jevMinDepth: PRESETS.bio_rd.jevMinDepth,
+    // 陷阱可疑阈值：派遣/收费培训/伪销售/触犯排除项任一概率高于此值转人工复核（≥0.7 直接拒）
+    jevMaxTrap: 0.35,
+    // 自动投递的最低等级：S / A / B，低于此等级但通过研判的岗位记为备选
+    jevMinTier: "A",
+    // 校准模式：只研判、打标记，不点沟通、不占额度、不写入已阅
+    jevDryRun: false,
+    activeTab: "jev"
   };
+
+  // Jev 分级的高低顺序（sanitizeSettings 在 state 初始化时就会用到，必须放在 state 之前）
+  const JEV_TIER_RANK = { S: 3, A: 2, B: 1 };
 
   const STATUS_LABELS = {
     IDLE: "空闲",
@@ -226,6 +165,13 @@
     STOPPED: "已停止",
     ERROR: "异常保护停止"
   };
+
+  // 泛研发领域词：仅在 Jev 研判开启时生效。标题/标签没命中包含词、但带有这些词的岗位（如"研究员""实验员""蛋白科学家"）
+  // 也点开详情交给 Jev 判断对口程度；纯规则模式下不使用，保持原有的严格预筛
+  const BROAD_TECH_WORDS = [
+    "研发", "研究", "实验", "科研", "生物", "生信", "医药", "药物", "制药", "蛋白",
+    "抗体", "细胞", "分子", "基因", "检测", "分析", "质检", "质控", "化验", "算法"
+  ];
 
   // 风控与拦截特征（弹窗文本 / 页面路径）
   const RISK_PATTERN = /验证码|安全验证|身份验证|请先登录|扫码登录|异常访问|访问受限|访问过于频繁|操作过于频繁|账号存在风险|账户存在风险|当前操作存在风险|安全风险|请稍后再试|人机验证|拖动滑块|请完成验证/;
@@ -251,6 +197,10 @@
     kw: { include: [], exclude: [] },
     batchCount: 0,
     consecutiveFailures: 0,
+    // Jev 连续调用失败次数（与页面异常分开计数）
+    jevFailures: 0,
+    // 校准模式下本次会话已研判的岗位（不落盘，正式投递时会重新评估）
+    sessionSeen: new Set(),
     emptyRounds: 0,
     currentMessage: "低频助手已就绪，点击【开始低频投递】",
     currentCompany: "",
@@ -290,7 +240,7 @@
     const record = {
       key,
       company,
-      title: title || "未知岗位",
+      title: title || "研发岗位",
       salary: salary || "",
       date: todayKey(),
       time: new Date().toLocaleTimeString("zh-CN", { hour12: false })
@@ -329,7 +279,7 @@
       alert("目前暂无已投递公司记录！只要运行助手沟通岗位，或者在页面中点击卡片，都会自动记录。");
       return;
     }
-    const lines = list.map(item => `${item.company} ${item.title || ""}`.trim()).join("\n");
+    const lines = list.map(item => `${item.company} ${item.title || "研发工程师"}`).join("\n");
     
     // 移除已有弹窗
     const old = document.getElementById("bh-export-modal");
@@ -345,7 +295,7 @@
           <button id="bh-modal-close" style="border:none;background:none;font-size:22px;line-height:1;cursor:pointer;color:#94a3b8;">&times;</button>
         </div>
         <p style="font-size:12px;color:#64748b;margin:0 0 10px 0;line-height:1.5;">
-          💡 <b>一键复制</b>：无需在下载目录里翻找文件，直接点击下方【一键复制】，粘贴到任意文本编辑器或下游工具即可使用：
+          💡 <b>NAS / 远程浏览器专属快捷方式</b>：无需在 NAS 容器内翻找下载目录！直接点击下方【一键复制】，粘贴到本地电脑的 <b>companies.txt</b> 即可直接开始 Python 邮箱挖掘：
         </p>
         <textarea id="bh-modal-txt" style="width:100%;height:190px;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-family:Consolas,monospace;font-size:12px;box-sizing:border-box;background:#f8fafc;color:#0f172a;line-height:1.5;resize:vertical;" readonly>${lines}</textarea>
         <div style="margin-top:14px;display:flex;justify-content:space-between;align-items:center;">
@@ -465,21 +415,27 @@
   }
 
   // 每次读取/保存都做一次规整：老版本设置和手输的异常值在这里统一收口。
-  // 重要：升级版本时绝不覆盖用户已经填好的关键词/招呼语，只补全缺失字段。
+  // 若检测到属于旧版化妆品关键词或版本升级，自动平滑升级为生物医药高转化预设。
   function sanitizeSettings(raw) {
-    const src = raw && typeof raw === "object" ? raw : {};
-    const s = { ...DEFAULT_SETTINGS };
-    for (const key of Object.keys(DEFAULT_SETTINGS)) {
-      if (src[key] !== undefined && src[key] !== null) s[key] = src[key];
-    }
-    s.version = SETTINGS_VERSION;
+    const src = raw && typeof raw === "object" ? { ...raw } : {};
+    const isOldVersion = !src.version || src.version !== SETTINGS_VERSION;
+    const hasOldKeywords = typeof src.includeKeywords === "string" && (src.includeKeywords.includes("化妆品研发") || src.includeKeywords.includes("配方师"));
 
-    s.presetKey = PRESETS[s.presetKey] ? s.presetKey : DEFAULT_PRESET_KEY;
+    if (isOldVersion || hasOldKeywords) {
+      src.includeKeywords = DEFAULT_SETTINGS.includeKeywords;
+      src.excludeKeywords = DEFAULT_SETTINGS.excludeKeywords;
+      src.greetingText = DEFAULT_SETTINGS.greetingText;
+      src.minSalaryK = DEFAULT_SETTINGS.minSalaryK;
+    }
+
+    const s = { ...DEFAULT_SETTINGS, ...src, version: SETTINGS_VERSION };
     s.intervalMin = clampNum(s.intervalMin, MIN_INTERVAL_SEC, 300, DEFAULT_SETTINGS.intervalMin);
     s.intervalMax = clampNum(s.intervalMax, s.intervalMin, 600, DEFAULT_SETTINGS.intervalMax);
     s.dailyMax = clampNum(s.dailyMax, 1, 150, DEFAULT_SETTINGS.dailyMax);
     s.minSalaryK = clampNum(s.minSalaryK, 0, 100, DEFAULT_SETTINGS.minSalaryK, false);
     s.excludeInternships = Boolean(s.excludeInternships);
+    s.maxExpYears = clampNum(s.maxExpYears, 0, 20, DEFAULT_SETTINGS.maxExpYears);
+    s.skipPhdJobs = Boolean(s.skipPhdJobs ?? DEFAULT_SETTINGS.skipPhdJobs);
     s.autoSendGreeting = Boolean(s.autoSendGreeting);
     s.includeKeywords = String(s.includeKeywords ?? "").trim();
     s.excludeKeywords = String(s.excludeKeywords ?? "").trim();
@@ -488,6 +444,17 @@
     s.panelHidden = Boolean(s.panelHidden);
     s.panelX = typeof s.panelX === "string" ? s.panelX : null;
     s.panelY = typeof s.panelY === "string" ? s.panelY : null;
+
+    // Jev 智能设置规整
+    s.jevEnabled = Boolean(s.jevEnabled ?? DEFAULT_SETTINGS.jevEnabled);
+    s.jevApiKey = String(s.jevApiKey || storeGet(STORAGE_KEYS.jevApiKey, "") || "").trim();
+    s.candidateProfile = String(s.candidateProfile || DEFAULT_SETTINGS.candidateProfile).trim();
+    s.jevMinDepth = clampNum(s.jevMinDepth, 0, 2, DEFAULT_SETTINGS.jevMinDepth, false);
+    s.jevMaxTrap = clampNum(s.jevMaxTrap, 0.05, 0.95, DEFAULT_SETTINGS.jevMaxTrap, false);
+    s.jevMinTier = JEV_TIER_RANK[s.jevMinTier] ? s.jevMinTier : DEFAULT_SETTINGS.jevMinTier;
+    s.jevDryRun = Boolean(s.jevDryRun);
+    delete s.jevOnlySAndA; // 旧版开关，已由 jevMinTier 取代
+    s.activeTab = String(s.activeTab || DEFAULT_SETTINGS.activeTab || "jev");
     return s;
   }
 
@@ -499,6 +466,9 @@
   }
 
   function saveSettings(patch) {
+    if (patch && patch.jevApiKey !== undefined) {
+      storeSet(STORAGE_KEYS.jevApiKey, String(patch.jevApiKey || "").trim());
+    }
     state.settings = sanitizeSettings({ ...state.settings, ...patch });
     storeSet(STORAGE_KEYS.settings, state.settings);
     rebuildKeywordCache();
@@ -629,15 +599,16 @@
     return hit ? hit.raw : null;
   }
 
-  // 初筛：只针对卡片文本（标题/公司/标签）快速判断
-  // 包含关键词留空 = 不按方向筛选（仅受排除词约束），便于做“不限方向”的通用投递
-  function checkCardQuickFilter(title, company, tags) {
+  // 初筛：只针对卡片文本（标题/公司/标签）快速判断。
+  // broad=true（Jev 研判开启）时，标题/标签带泛研发领域词也放行，对口与否交给 Jev
+  function checkCardQuickFilter(title, company, tags, broad = false) {
     const cardText = `${title} ${company} ${tags.join(" ")}`;
     const ex = findMatch(cardText, state.kw.exclude);
     if (ex) return { pass: false, skipReason: `卡片命中排除词【${ex}】` };
-    if (state.kw.include.length === 0) return { pass: true };
     if (findMatch(cardText, state.kw.include)) return { pass: true };
-    return { pass: false, skipReason: "卡片未命中任何包含关键词" };
+    const roleText = `${title} ${tags.join(" ")}`;
+    if (broad && BROAD_TECH_WORDS.some(w => roleText.includes(w))) return { pass: true };
+    return { pass: false, skipReason: "岗位方向非目标技术/研发类" };
   }
 
   // 深筛：结合右侧详情描述进行校验
@@ -648,6 +619,399 @@
       return { pass: false, reason: "详情未命中任何目标关键词" };
     }
     return { pass: true, reason: "" };
+  }
+
+  // 卡片标签里的经验要求下限（年）："经验不限/在校/应届/1年以内" 视为 0；识别不出返回 null（不过滤）
+  function parseExpMinYears(tags) {
+    for (const raw of tags) {
+      const t = String(raw).replace(/\s/g, "");
+      if (/经验不限|在校|应届|1年以内/.test(t)) return 0;
+      const m = t.match(/^(\d+)(?:-\d+)?年(?:以上)?$/);
+      if (m) return Number(m[1]);
+    }
+    return null;
+  }
+
+  // ========================== Jev 决策引擎 ==========================
+  // 问题设计遵循 TypeSafe 官方指引（docs.typesafe.ai）：英文指令（Jev 的主训练语言）、一问一判、
+  // 数字比较留在代码里、state 只放与判断相关的内容、用 probabilities 区分"判定"与"拿不准"。
+  // 模型版本钉死，调好的阈值才不会随 jev-latest 升级而漂移。
+  const JEV_ENDPOINTS = {
+    typesafe: { url: "https://api.typesafe.ai/v1/systemone", model: "jev-1.13.0" },
+    openrouter: { url: "https://openrouter.ai/api/alpha/decisions", model: "typesafe/jev-1.13" }
+  };
+  // TypeSafe 直连不返回 cost，按官方价 $0.042 / 百万输入 token 估算（输出免费）
+  const JEV_USD_PER_INPUT_TOKEN = 0.042 / 1e6;
+  // 永久性错误（Key 无效、余额不足、请求格式错误等），重试无意义，立即暂停
+  const JEV_FATAL_STATUS = [400, 401, 402, 403, 404, 413, 422];
+  // 限流 / 服务端错误 / 超时的退避重试间隔
+  const JEV_RETRY_WAITS_MS = [2000, 5000];
+  // 陷阱类问题概率 ≥ 此值直接拒；介于 jevMaxTrap 与此值之间转人工复核
+  const JEV_TRAP_REJECT = 0.7;
+  // "相近可转或直接对口" 的概率之和：低于前者直接拒，低于后者转人工复核
+  const JEV_FIT_REJECT_BELOW = 0.3;
+  const JEV_FIT_PASS_AT = 0.7;
+  // 职位描述正文上限（Jev 上下文 32k token，这里只防兜底取到整块详情时过长）
+  const JEV_JD_MAX_CHARS = 4000;
+
+  function getActiveJevKey() {
+    return (state.settings.jevApiKey || storeGet(STORAGE_KEYS.jevApiKey, "") || "").trim();
+  }
+
+  function isJevActive() {
+    return Boolean(state.settings.jevEnabled && getActiveJevKey());
+  }
+
+  function jevError(message, status = 0, fatal = false) {
+    const err = new Error(message);
+    err.status = status;
+    err.fatal = fatal;
+    return err;
+  }
+
+  function postJev(payload, key) {
+    const isOpenRouter = key.startsWith("sk-or-");
+    const endpoint = isOpenRouter ? JEV_ENDPOINTS.openrouter : JEV_ENDPOINTS.typesafe;
+    const headers = {
+      "Authorization": `Bearer ${key}`,
+      "Content-Type": "application/json"
+    };
+    if (isOpenRouter) {
+      headers["X-OpenRouter-Title"] = "BOSS Auto Job Helper";
+    }
+
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "POST",
+        url: endpoint.url,
+        headers,
+        data: JSON.stringify({ ...payload, model: endpoint.model }),
+        timeout: 15000,
+        onload: res => {
+          if (res.status >= 200 && res.status < 300) {
+            try {
+              const data = JSON.parse(res.responseText);
+              if (data && data.answers) resolve(data);
+              else reject(jevError("Jev 响应缺失 answers 属性"));
+            } catch (err) {
+              reject(jevError("Jev 响应 JSON 解析失败: " + err.message));
+            }
+            return;
+          }
+          let msg = `HTTP ${res.status}`;
+          try {
+            const errObj = JSON.parse(res.responseText);
+            if (errObj.error?.message) msg += `: ${errObj.error.message}`;
+            else if (errObj.message) msg += `: ${errObj.message}`;
+            else if (errObj.detail) msg += `: ${typeof errObj.detail === "string" ? errObj.detail : JSON.stringify(errObj.detail)}`;
+          } catch {}
+          reject(jevError(msg, res.status, JEV_FATAL_STATUS.includes(res.status)));
+        },
+        ontimeout: () => reject(jevError("Jev 网络请求超时 (15秒)")),
+        onerror: e => reject(jevError(`网络请求失败: ${e.statusText || "网络异常"}`))
+      });
+    });
+  }
+
+  // 返回完整响应 { model, answers, usage }。限流/服务端错误/超时自动退避重试，永久性错误直接抛出（err.fatal）
+  async function requestJevAPI(payload) {
+    const key = getActiveJevKey();
+    if (!key) throw jevError("未配置 Jev API Key", 0, true);
+    if (typeof GM_xmlhttpRequest !== "function") throw jevError("当前运行环境缺少 GM_xmlhttpRequest 授权", 0, true);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await postJev(payload, key);
+      } catch (err) {
+        if (err.fatal || attempt >= JEV_RETRY_WAITS_MS.length) throw err;
+        await sleep(JEV_RETRY_WAITS_MS[attempt]);
+      }
+    }
+  }
+
+  // 6 个问题一次请求、并行评估，只付一份 state 的成本。问题 id 不会发给模型，完整语义都写在 instructions 里；
+  // 每级/每侧的 examples 用中文 JD 风格，贴近真实输入才有帮助。经验年限、学历、薪资这类数字比较留在代码里做。
+  const JEV_QUESTIONS = {
+    fit: {
+      type: "score",
+      instructions: "How closely do the main duties in `job` match the target roles and core skills in `candidate.profile`?",
+      criteria: [
+        "The job is in a different field from `candidate.profile`, or it is a non-technical role such as sales, customer service, admin, recruiting or general labor",
+        "The job is in the same broad industry, but its main duties need a specialty that `candidate.profile` does not list",
+        "Some main duties use skills listed in `candidate.profile`, and the rest is a closely related specialty the candidate could learn within weeks",
+        "The main duties directly use the core skills or match the target role listed in `candidate.profile`"
+      ]
+    },
+    depth: {
+      type: "score",
+      instructions: "How much independent technical or scientific work do the duties in `job.description` involve?",
+      criteria: [
+        { what: "Routine support or manual work that needs little technical judgment", examples: ["负责实验室日常清洁、器皿清洗和耗材整理", "按要求录入数据、整理台账", "流水线包装、设备看管"] },
+        { what: "Runs established procedures, standard assays or existing pipelines and reports the results", examples: ["按SOP完成样品检测并出具报告", "协助研究员完成质粒提取、细胞培养等常规实验", "运行已有分析流程并整理结果"] },
+        { what: "Designs or optimizes experiments, methods or pipelines, or owns a research or development project", examples: ["独立设计实验方案并优化工艺参数", "负责新抗体或新蛋白的开发与表征", "搭建并优化生信分析流程"] }
+      ]
+    },
+    dispatch: {
+      type: "noul",
+      instructions: "Is the person hired for `job` employed through a labor-dispatch or staffing agency, or sent to work on-site at a different client company?",
+      criteria: {
+        true: { what: "The posting says or clearly implies dispatch, third-party staffing, or on-site placement at a client", examples: ["劳务派遣", "外包岗位，派驻到合作药企", "与第三方人力公司签订劳动合同"] },
+        false: "`job.company` hires the person as its own employee. A CRO or CDMO hiring staff for its own labs counts as its own employee."
+      }
+    },
+    paid_training: {
+      type: "noul",
+      instructions: "Does `job` require applicants to pay money, or to finish a training course before they get a job offer?",
+      criteria: {
+        true: { what: "Applicants must pay training fees, take a training loan, pay a deposit, or pass a training course before being hired", examples: ["先培训后上岗，培训费用可分期", "招转培", "入职需缴纳押金"] },
+        false: "Applicants pay nothing. Free onboarding training provided by the employer after hiring is normal."
+      }
+    },
+    sales_in_disguise: {
+      type: "noul",
+      instructions: "Are the main duties in `job.description` selling products, promoting to customers, or meeting sales targets?",
+      criteria: {
+        true: { what: "Most duties are selling, promotion, business development or customer acquisition", examples: ["负责区域客户开发，完成销售指标", "医院学术推广", "维护经销商渠道"] },
+        false: "The main duties are technical, scientific or laboratory work, including technical support that carries no sales target"
+      }
+    },
+    excluded: {
+      type: "noul",
+      instructions: "Is the main work in `job` one of the job types that `candidate.profile` explicitly says to exclude?"
+    }
+  };
+
+  /**
+   * 对展开的职位做一次 Jev 研判
+   * @param {{title: string, company: string}} job
+   * @param {string} description 职位描述正文
+   * @returns {Promise<Object>} 成功返回 interpretJevAnswers 的结论；失败返回 { failed, fatal, reason }，调用方绝不放行
+   */
+  async function evaluateJobWithJev(job, description) {
+    const payload = {
+      state: {
+        candidate: { profile: state.settings.candidateProfile || PRESETS.bio_rd.candidateProfile },
+        job: {
+          title: job.title,
+          company: job.company,
+          description: (description || "").slice(0, JEV_JD_MAX_CHARS)
+        }
+      },
+      questions: JEV_QUESTIONS
+    };
+    try {
+      const data = await requestJevAPI(payload);
+      const verdict = interpretJevAnswers(readJevAnswers(data.answers));
+      verdict.model = String(data.model || "");
+      verdict.costUsd = jevCostUsd(data.usage);
+      return verdict;
+    } catch (error) {
+      return { failed: true, fatal: Boolean(error.fatal), reason: error.message };
+    }
+  }
+
+  function jevCostUsd(usage) {
+    if (!usage) return 0;
+    if (typeof usage.cost === "number") return usage.cost;
+    return (Number(usage.input_tokens) || 0) * JEV_USD_PER_INPUT_TOKEN;
+  }
+
+  // 严格读取：缺字段或类型不对就当作调用失败，而不是拿默认值糊过去
+  function readJevAnswers(answers) {
+    const need = (id, field) => {
+      const a = answers && answers[id];
+      if (!a || typeof a[field] !== "number") throw jevError(`Jev 响应缺少 ${id}.${field}`);
+      return a;
+    };
+    const fit = need("fit", "score");
+    const p = fit.probabilities;
+    if (!p || typeof p !== "object") throw jevError("Jev 响应缺少 fit.probabilities");
+    return {
+      fit: fit.score,
+      // 落在"相近可转"与"直接对口"两级上的概率之和，即 Jev 认为这个岗位值得投的把握
+      fitMass: (Number(p["2"]) || 0) + (Number(p["3"]) || 0),
+      depth: need("depth", "score").score,
+      traps: {
+        dispatch: need("dispatch", "noul").noul,
+        paid_training: need("paid_training", "noul").noul,
+        sales_in_disguise: need("sales_in_disguise", "noul").noul,
+        excluded: need("excluded", "noul").noul
+      }
+    };
+  }
+
+  const JEV_TRAP_LABELS = {
+    dispatch: "劳务派遣/外派驻场",
+    paid_training: "收费培训/招转培",
+    sales_in_disguise: "名为技术实为销售",
+    excluded: "属于画像里的绝对排除项"
+  };
+  const JEV_TIER_BADGES = {
+    S: { text: "💎 S级·核心对口", cls: "bh-badge-s" },
+    A: { text: "⭐ A级·对口", cls: "bh-badge-a" },
+    B: { text: "🔹 B级·相近可转", cls: "bh-badge-b" }
+  };
+
+  /**
+   * 把 Jev 的原始判断变成动作：先看明确的红线（拒），再看拿不准的（转人工复核），最后分级。
+   * verdict: "apply" 自动投递 | "hold" 通过但低于自动投递等级，记为备选 | "review" 待人工复核 | "reject" 拒绝
+   */
+  function interpretJevAnswers(r) {
+    const s = state.settings;
+    const pct = v => `${Math.round(v * 100)}%`;
+    const [trapKey, trapProb] = Object.entries(r.traps).sort((a, b) => b[1] - a[1])[0];
+    const trapName = JEV_TRAP_LABELS[trapKey];
+    const reject = (badge, reason) => ({ ...r, verdict: "reject", tier: "", badgeText: `🚫 ${badge}`, badgeClass: "bh-badge-reject", reason });
+    const review = (badge, reason) => ({ ...r, verdict: "review", tier: "", badgeText: `🟡 待复核·${badge}`, badgeClass: "bh-badge-b", reason });
+
+    // 1. 明确的红线：一票否决
+    if (trapProb >= JEV_TRAP_REJECT) {
+      return reject(trapName, `Jev 判定${trapName}（${pct(trapProb)}）`);
+    }
+    if (r.fitMass < JEV_FIT_REJECT_BELOW) {
+      return reject("专业不对口", `Jev 判定专业不对口（相近或对口的概率仅 ${pct(r.fitMass)}）`);
+    }
+    if (r.depth < s.jevMinDepth) {
+      return reject(`偏打杂 (深度${r.depth.toFixed(1)})`, `Jev 判定研发深度 ${r.depth.toFixed(2)}，低于门槛 ${s.jevMinDepth}`);
+    }
+
+    // 2. 拿不准：不自动投、也不自动拒，交给人
+    if (trapProb > s.jevMaxTrap) {
+      return review(trapName, `Jev 对"${trapName}"拿不准（${pct(trapProb)}）`);
+    }
+    if (r.fitMass < JEV_FIT_PASS_AT) {
+      return review("对口存疑", `Jev 对专业对口拿不准（相近或对口的概率 ${pct(r.fitMass)}）`);
+    }
+
+    // 3. 分级：直接对口为 A，深度也高为 S，相近可转为 B
+    const tier = r.fit >= 2.5 ? (r.depth >= 1.5 ? "S" : "A") : "B";
+    const apply = JEV_TIER_RANK[tier] >= JEV_TIER_RANK[s.jevMinTier];
+    const detail = `对口 ${r.fit.toFixed(1)}/3，深度 ${r.depth.toFixed(1)}/2，最高风险 ${trapName} ${pct(trapProb)}`;
+    return {
+      ...r,
+      verdict: apply ? "apply" : "hold",
+      tier,
+      badgeText: `${JEV_TIER_BADGES[tier].text} (深度${r.depth.toFixed(1)})`,
+      badgeClass: JEV_TIER_BADGES[tier].cls,
+      reason: `Jev ${tier}级（${detail}）${apply ? "" : `，低于自动投递等级 ${s.jevMinTier}，记为备选`}`
+    };
+  }
+
+  function loadJevDecisions() {
+    const list = storeGet(STORAGE_KEYS.jevDecisions, []);
+    return Array.isArray(list) ? list : [];
+  }
+
+  // 每个岗位的 Jev 原始判断与结论都落盘，用于事后抽查、校准阈值
+  function recordJevDecision(job, v, dryRun) {
+    const r2 = x => Math.round(x * 100) / 100;
+    const list = loadJevDecisions();
+    list.push({
+      at: new Date().toLocaleString("zh-CN", { hour12: false }),
+      ...job,
+      verdict: v.verdict,
+      tier: v.tier,
+      dryRun: Boolean(dryRun),
+      reason: v.reason,
+      fit: r2(v.fit),
+      fitMass: r2(v.fitMass),
+      depth: r2(v.depth),
+      traps: Object.fromEntries(Object.entries(v.traps).map(([k, p]) => [k, r2(p)])),
+      model: v.model,
+      costUsd: v.costUsd
+    });
+    storeSet(STORAGE_KEYS.jevDecisions, list.slice(-MAX_JEV_DECISIONS));
+  }
+
+  const JEV_VERDICT_LABELS = { apply: "✅投递", hold: "🔹备选", review: "🟡待复核", reject: "🚫拒绝" };
+
+  function formatJevDecision(d) {
+    const pct = v => `${Math.round((v || 0) * 100)}%`;
+    const t = d.traps || {};
+    const verdict = d.dryRun && d.verdict === "apply" ? "🧪会投" : JEV_VERDICT_LABELS[d.verdict] || d.verdict;
+    return `[${d.at}] ${verdict}${d.tier ? " " + d.tier : ""} | ${d.company} · ${d.title} ${d.salary || ""}\n` +
+      `    对口${d.fit}/3（相近或对口${pct(d.fitMass)}） 深度${d.depth}/2 | 派遣${pct(t.dispatch)} 收费培训${pct(t.paid_training)} 伪销售${pct(t.sales_in_disguise)} 排除项${pct(t.excluded)}` +
+      (d.url ? `\n    ${d.url}` : "");
+  }
+
+  function showJevDecisionsModal() {
+    const all = loadJevDecisions().slice().reverse();
+    if (!all.length) {
+      alert("还没有 Jev 决策记录。开启 Jev 研判（建议先勾选校准模式）跑一轮就会生成。");
+      return;
+    }
+    const old = document.getElementById("bh-jev-modal");
+    if (old) old.remove();
+
+    const count = v => all.filter(d => d.verdict === v).length;
+    const cost = all.reduce((sum, d) => sum + (Number(d.costUsd) || 0), 0);
+
+    const modal = document.createElement("div");
+    modal.id = "bh-jev-modal";
+    modal.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:99999999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px);";
+    modal.innerHTML = `
+      <div style="background:#ffffff;border-radius:12px;width:680px;max-width:94%;padding:20px 22px;box-shadow:0 16px 40px rgba(0,0,0,0.3);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:13px;color:#1e293b;box-sizing:border-box;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;border-bottom:1px solid #e2e8f0;padding-bottom:8px;">
+          <b style="font-size:15px;color:#15803d;">📊 Jev 决策记录（保留最近 ${MAX_JEV_DECISIONS} 条）</b>
+          <button data-act="close" style="border:none;background:none;font-size:22px;line-height:1;cursor:pointer;color:#94a3b8;">&times;</button>
+        </div>
+        <div data-role="summary" style="font-size:12px;color:#475569;margin-bottom:6px;"></div>
+        <label style="font-size:12px;color:#334155;display:flex;align-items:center;gap:4px;margin-bottom:6px;cursor:pointer;">
+          <input type="checkbox" data-act="filter"> 只看待复核和备选（需要你手动处理的岗位）
+        </label>
+        <textarea data-role="list" readonly style="width:100%;height:320px;border:1px solid #cbd5e1;border-radius:8px;padding:10px;font-family:Consolas,monospace;font-size:12px;box-sizing:border-box;background:#f8fafc;color:#0f172a;line-height:1.5;resize:vertical;"></textarea>
+        <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+          <button data-act="clear" style="background:#f1f5f9;color:#b91c1c;border:1px solid #fecaca;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:12px;">🗑 清空记录</button>
+          <button data-act="download" style="background:#15803d;color:#ffffff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer;font-weight:600;font-size:12px;">📥 下载 JSON</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    // 岗位标题/公司名来自页面，一律走 textContent / value，不拼进 innerHTML
+    modal.querySelector('[data-role="summary"]').textContent =
+      `共 ${all.length} 条：投递 ${count("apply")} · 备选 ${count("hold")} · 待复核 ${count("review")} · 拒绝 ${count("reject")}｜Jev 花费约 $${cost.toFixed(4)}`;
+    const listEl = modal.querySelector('[data-role="list"]');
+    const render = onlyPending => {
+      const rows = onlyPending ? all.filter(d => d.verdict === "review" || d.verdict === "hold") : all;
+      listEl.value = rows.length ? rows.map(formatJevDecision).join("\n") : "（没有需要手动处理的岗位）";
+    };
+    render(false);
+
+    modal.querySelector('[data-act="filter"]').addEventListener("change", e => render(e.target.checked));
+    modal.querySelector('[data-act="close"]').addEventListener("click", () => modal.remove());
+    modal.querySelector('[data-act="download"]').addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify(all, null, 2)], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `boss_jev_decisions_${todayKey()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+    modal.querySelector('[data-act="clear"]').addEventListener("click", () => {
+      if (!confirm("确定清空全部 Jev 决策记录吗？")) return;
+      storeSet(STORAGE_KEYS.jevDecisions, []);
+      modal.remove();
+      addLog("已清空 Jev 决策记录");
+    });
+    modal.addEventListener("click", e => {
+      if (e.target === modal) modal.remove();
+    });
+  }
+
+  function injectCardBadge(card, text, className) {
+    if (!card) return;
+    let badge = card.querySelector(".bh-jev-card-badge");
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "bh-jev-card-badge";
+      const target = card.querySelector(SEL.jobName) || card.querySelector(".job-name, .job-title, [class*='job-name']") || card;
+      target.appendChild(badge);
+    }
+    badge.className = `bh-jev-card-badge ${className || ""}`;
+    badge.textContent = text;
   }
 
   // ========================== DOM 辅助 ==========================
@@ -749,6 +1113,19 @@
     return el ? (el.innerText || "").trim() : "";
   }
 
+  // 只取职位描述正文，不带按钮、BOSS 信息、公司介绍等噪声；拿不到时退回整块详情
+  function getJobDescription() {
+    const el = getDetailElement();
+    if (!el) return "";
+    const jd = el.querySelector(SEL.jdText);
+    return ((jd && jd.innerText) || el.innerText || "").trim();
+  }
+
+  function getCardUrl(card) {
+    const link = card.querySelector('a[href*="/job_detail/"]');
+    return link ? link.href : "";
+  }
+
   // 安全点击卡片：阻止 <a target=_blank> 打开新标签或跳转，站点自身的 SPA 点击逻辑不受影响
   function clickCard(card) {
     const target = card.querySelector(SEL.cardClickTarget) || card;
@@ -831,35 +1208,13 @@
     }
   }
 
-  // 若弹窗/聊天区出现可编辑输入框，填入定制介绍并发送一次；返回是否已发送
-  async function trySendGreeting(dialogs) {
-    const roots = dialogs.length ? dialogs : Array.from(document.querySelectorAll(".chat-conversation, .boss-popup__wrapper, .dialog-wrap, .chat-message-box"));
-    for (const root of roots) {
-      const input = Array.from(root.querySelectorAll(SEL.chatInput)).find(el => isVisible(el) && !inPanel(el));
-      if (!input) continue;
-      try {
-        setInputValue(input, state.settings.greetingText);
-        await sleep(400);
-        const sendBtn = Array.from(root.querySelectorAll(SEL.sendButton)).find(el => isVisible(el))
-          || findVisibleButtonByText(root, /^(发送|确定发送|确认发送|留个言)$/);
-        if (sendBtn) {
-          sendBtn.click();
-          addLog("已自动发送高转化求职介绍");
-          await sleep(600);
-          return true;
-        }
-      } catch {}
-    }
-    return false;
-  }
-
   // 点击“立即沟通”之后等待平台反馈，确认是否真的建立了沟通。
+  // 遵循平台 Host 真实逻辑：点击立即沟通后，平台自动发送账号官方默认招呼语建立会话。
   // 返回 { result: "confirmed" | "limit" | "risk" | "unconfirmed", text? }
   async function confirmContact() {
     const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
     let confirmed = false;
     let stayed = false;
-    let greetingSent = false;
 
     while (Date.now() < deadline) {
       const dialogs = getVisibleDialogs();
@@ -874,12 +1229,7 @@
         if (/已向.*发送|发送成功|已发送/.test(t)) confirmed = true;
       }
 
-      // 2. 出现可编辑的打招呼输入框时，只发送一次定制介绍
-      if (!greetingSent && state.settings.autoSendGreeting && state.settings.greetingText) {
-        greetingSent = await trySendGreeting(dialogs);
-      }
-
-      // 3. “留在此页”确认框：平台已自动发送默认招呼语，点击留在列表页
+      // 2. “留在此页”确认框：平台发送官方打招呼后提示是否查看会话，自动点击留在列表页
       if (!stayed) {
         const stayBtn = findVisibleButtonByText(document, /^留在此页$/);
         if (stayBtn) {
@@ -892,7 +1242,7 @@
         }
       }
 
-      // 4. 详情面板按钮变成“继续沟通”即视为成功
+      // 3. 详情面板按钮变成“继续沟通”即视为建立成功
       const contact = findContactButton();
       if (contact && contact.state === "already_contacted") confirmed = true;
 
@@ -1018,14 +1368,40 @@
     notify(`平台提示【${text}】，已停止今日投递`);
   }
 
+  function pauseForJev(message) {
+    state.mode = "PAUSED";
+    setMessage(`⚠️ Jev 不可用，已暂停：${message}`);
+    addLog(`⛔ Jev 不可用，已暂停（不会降级为纯规则投递）：${message}`);
+    playBeep(300, 500);
+    notify(`Jev 不可用，已暂停投递：${message}`);
+  }
+
+  // Jev 失败时绝不放行：本岗位退回未读（稍后重试），永久性错误或连续失败则暂停
+  async function handleJevFailure(verdict, key, label) {
+    state.visitedKeys.delete(key);
+    state.sessionSeen.delete(key);
+    storeSet(STORAGE_KEYS.visited, Array.from(state.visitedKeys));
+    state.stats.failed++;
+    state.jevFailures++;
+    saveStats();
+    addLog(`⚠️ Jev 研判失败 [${verdict.reason}]：${label}（未投递，稍后重试）`);
+    if (verdict.fatal || state.jevFailures >= MAX_JEV_FAILURES) {
+      pauseForJev(verdict.fatal ? verdict.reason : `连续 ${state.jevFailures} 次调用失败：${verdict.reason}`);
+      return "stop";
+    }
+    await sleep(jitter(4000, 2000));
+    return "handled";
+  }
+
   // 处理一张未评估过的卡片。返回 "handled" | "no_target" | "no_more" | "stop"
   async function processNextCard() {
+    const dryRun = state.settings.jevDryRun;
     const cards = getVisibleJobCards();
     let targetCard = null;
     let targetKey = "";
     for (const card of cards) {
       const key = getCardKey(card);
-      if (key && !state.visitedKeys.has(key)) {
+      if (key && !state.visitedKeys.has(key) && !(dryRun && state.sessionSeen.has(key))) {
         targetCard = card;
         targetKey = key;
         break;
@@ -1051,7 +1427,9 @@
     state.emptyRounds = 0;
 
     // 立即打标记录，防止任何偶发情况导致重复评估
-    recordVisited(targetKey);
+    // 校准模式只记在本次会话里（不落盘），切回正式投递时这些岗位会重新评估
+    if (dryRun) state.sessionSeen.add(targetKey);
+    else recordVisited(targetKey);
 
     const { title, company, rawSalary, tags } = extractCardInfo(targetCard);
     const label = `${company} · ${title}`;
@@ -1071,8 +1449,20 @@
       }
     }
 
-    // 卡片级关键词初筛 (避免点击无关岗位)
-    const quick = checkCardQuickFilter(title, company, tags);
+    // 经验年限、学历这类数字/等级比较在代码里做（Jev 不擅长数值比较）
+    if (state.settings.maxExpYears > 0) {
+      const expMin = parseExpMinYears(tags);
+      if (expMin !== null && expMin >= state.settings.maxExpYears) {
+        return skipCard(`经验要求${expMin}年起，超出上限${state.settings.maxExpYears}年`, label, 1200, 800);
+      }
+    }
+    if (state.settings.skipPhdJobs && tags.some(t => /博士/.test(t))) {
+      return skipCard("要求博士学历", label, 1200, 800);
+    }
+
+    // 两级关键词初筛 (避免点击无关岗位，但保留广义研发助理以点开深查)
+    const jevActive = isJevActive();
+    const quick = checkCardQuickFilter(title, company, tags, jevActive);
     if (!quick.pass) return skipCard(quick.skipReason, label, 1400, 900);
 
     // 展开右侧详情，并确认详情已切换到本岗位
@@ -1085,18 +1475,46 @@
     }
     state.consecutiveFailures = 0; // 详情能正常加载，说明页面工作正常
 
-    // 深度核验详情描述（确保命中目标关键词，且无隐蔽销售话术）
-    const deep = checkDetailKeywords(`${title} ${company} ${tags.join(" ")} ${detailText}`);
-    if (!deep.pass) return skipCard(deep.reason, label, 2000, 1200);
+    if (!jevActive) {
+      // 纯规则模式：本地关键词深筛（挡掉明显冲突的黑名单词）
+      const deep = checkDetailKeywords(`${title} ${company} ${tags.join(" ")} ${detailText}`);
+      if (!deep.pass) return skipCard(deep.reason, label, 2000, 1200);
+    } else {
+      // Jev 模式：正文不再用关键词一票否决（"集研发、生产、销售于一体""补充商业保险"这类字眼会误杀），
+      // 对口、深度、陷阱全部交给 Jev；它出错时绝不放行
+      setMessage(`Jev 研判中：${label}`);
+      const verdict = await evaluateJobWithJev({ title, company }, getJobDescription());
+      if (verdict.failed) return handleJevFailure(verdict, targetKey, label);
+      state.jevFailures = 0;
+      recordJevDecision({ key: targetKey, url: getCardUrl(targetCard), company, title, salary: decodeBossSalary(rawSalary) }, verdict, dryRun);
+      injectCardBadge(targetCard, verdict.badgeText, verdict.badgeClass);
+      if (verdict.verdict !== "apply") {
+        const kind = { review: "待复核", hold: "备选", reject: "Jev 拒绝" }[verdict.verdict];
+        return skipCard(`${kind}·${verdict.reason}`, label, 1800, 1000);
+      }
+      addLog(`✨ [Jev 研判通过] ${verdict.reason}`);
+    }
 
-    // 检查沟通按钮状态
+    // 3. 检查沟通按钮状态 (严格遵循 Host 规则：已沟通则跳过，仅在未沟通时点击立即沟通)
     const contact = findContactButton();
     if (!contact) return skipCard("未匹配到沟通入口", label, 1500, 0);
-    if (contact.state !== "ready") return skipCard(CONTACT_SKIP_LABELS[contact.state] || contact.text, label, 1500, 0);
+    if (contact.state === "already_contacted") {
+      return skipCard("此前已沟通 (继续沟通状态)", label, 1500, 0);
+    }
+    if (contact.state !== "ready") {
+      return skipCard(CONTACT_SKIP_LABELS[contact.state] || contact.text, label, 1500, 0);
+    }
 
-    // 触发立即沟通：先落盘意图再点击
+    // 校准模式到此为止：只记录"会投递"，不点击沟通、不占额度
+    if (dryRun) {
+      addLog(`🧪 [校准] 会投递：${label}`);
+      await sleep(jitter(2500, 1500));
+      return "handled";
+    }
+
+    // 4. 触发立即沟通：点击按钮由平台发送官方预设招呼语建立会话
     savePendingContact({ key: targetKey, company, title, date: todayKey(), at: Date.now() });
-    addLog(`🎯 命中意向岗位：${label} (${decodeBossSalary(rawSalary) || "薪资未知"})`);
+    addLog(`🎯 触发立即沟通：${label} (${decodeBossSalary(rawSalary) || "薪资未知"})`);
     contact.button.click();
     await sleep(1200);
     const confirm = await confirmContact();
@@ -1143,8 +1561,12 @@
     state.isRunning = true;
     state.mode = "RUNNING";
     state.consecutiveFailures = 0;
+    state.jevFailures = 0;
     state.emptyRounds = 0;
-    addLog("=== 低频自动投递已启动 (慢速防封模式) ===");
+    const s = state.settings;
+    const modeText = s.jevDryRun ? "🧪 校准模式已启动（只研判、不投递）" : "低频自动投递已启动 (慢速防封模式)";
+    const jevText = isJevActive() ? `Jev 研判开启，自动投递最低等级 ${s.jevMinTier}` : "纯关键词规则";
+    addLog(`=== ${modeText} · ${jevText} ===`);
     renderStatus();
 
     try {
@@ -1152,7 +1574,7 @@
         rollStatsIfNewDay();
 
         // 每日配额上限检查
-        if (state.stats.success >= state.settings.dailyMax) {
+        if (!state.settings.jevDryRun && state.stats.success >= state.settings.dailyMax) {
           state.mode = "STOPPED";
           setMessage("今日已达上限，已稳妥停止");
           addLog(`今日已达低频安全上限 (${state.settings.dailyMax})，投递自动停止`);
@@ -1218,32 +1640,35 @@
         position: fixed;
         right: 20px;
         bottom: 20px;
-        width: 340px;
+        width: 360px;
+        max-height: 88vh;
         z-index: 9999999;
         box-sizing: border-box;
-        padding: 14px;
-        border-radius: 12px;
+        padding: 12px 14px 10px 14px;
+        border-radius: 14px;
         background: #ffffff;
         color: #1f2937;
-        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(13, 148, 136, 0.35);
-        font-size: 13px;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22), 0 0 0 1px rgba(13, 148, 136, 0.3);
+        font-size: 12px;
         line-height: 1.45;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         user-select: none;
+        display: flex;
+        flex-direction: column;
       }
       #${PANEL_ID} * { box-sizing: border-box; }
       #${PANEL_ID} .bh-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 8px;
-        padding-bottom: 6px;
+        margin-bottom: 6px;
+        padding-bottom: 5px;
         border-bottom: 1px solid #e5e7eb;
         cursor: move;
       }
       #${PANEL_ID} .bh-title {
         font-weight: 700;
-        font-size: 14px;
+        font-size: 13px;
         color: #0d9488;
         display: flex;
         align-items: center;
@@ -1251,7 +1676,7 @@
       }
       #${PANEL_ID} .bh-badge {
         display: inline-block;
-        font-size: 11px;
+        font-size: 10px;
         padding: 2px 6px;
         border-radius: 4px;
         background: #ccfbf1;
@@ -1265,66 +1690,68 @@
       }
       #${PANEL_ID} .bh-btn-tool {
         border: none;
-        background: #f3f4f6;
-        color: #4b5563;
+        background: #f1f5f9;
+        color: #475569;
         border-radius: 6px;
-        padding: 4px 8px;
+        padding: 3px 7px;
         cursor: pointer;
-        font-size: 12px;
-        transition: all 0.2s;
+        font-size: 11px;
+        transition: all 0.15s;
       }
-      #${PANEL_ID} .bh-btn-tool:hover { background: #e5e7eb; color: #111827; }
+      #${PANEL_ID} .bh-btn-tool:hover { background: #e2e8f0; color: #0f172a; }
       #${PANEL_ID}.is-collapsed { width: 230px; padding: 10px 14px; }
       #${PANEL_ID}.is-collapsed .bh-body { display: none; }
       #${PANEL_ID}.is-collapsed .bh-header { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
-      #${PANEL_ID} .bh-row { display: flex; gap: 8px; margin: 6px 0; }
-      #${PANEL_ID} .bh-col { flex: 1; }
-      #${PANEL_ID} label { display: block; font-size: 11px; color: #4b5563; margin-bottom: 2px; font-weight: 500; }
-      #${PANEL_ID} input[type="number"], #${PANEL_ID} textarea {
-        width: 100%;
-        border: 1px solid #d1d5db;
-        border-radius: 6px;
-        padding: 5px 7px;
-        color: #111827;
-        font-size: 12px;
-        font-family: inherit;
-        user-select: text;
+      #${PANEL_ID} .bh-body {
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
       }
-      #${PANEL_ID} textarea { resize: vertical; min-height: 40px; }
-      #${PANEL_ID} select {
-        border: 1px solid #d1d5db;
+      #${PANEL_ID} .bh-row { display: flex; gap: 6px; margin: 4px 0; }
+      #${PANEL_ID} .bh-col { flex: 1; }
+      #${PANEL_ID} label { display: block; font-size: 10px; color: #475569; margin-bottom: 2px; font-weight: 600; }
+      #${PANEL_ID} input[type="number"], #${PANEL_ID} input[type="text"], #${PANEL_ID} input[type="password"], #${PANEL_ID} textarea, #${PANEL_ID} select {
+        width: 100%;
+        border: 1px solid #cbd5e1;
         border-radius: 6px;
         padding: 4px 6px;
-        color: #111827;
-        font-size: 12px;
+        color: #0f172a;
+        font-size: 11px;
         font-family: inherit;
+        user-select: text;
         background: #ffffff;
-        cursor: pointer;
       }
+      #${PANEL_ID} input:focus, #${PANEL_ID} textarea:focus, #${PANEL_ID} select:focus {
+        border-color: #0d9488;
+        outline: none;
+        box-shadow: 0 0 0 2px rgba(13, 148, 136, 0.15);
+      }
+      #${PANEL_ID} textarea { resize: vertical; min-height: 36px; line-height: 1.4; }
       #${PANEL_ID} .bh-checkbox-row {
         display: flex;
         align-items: center;
-        gap: 6px;
-        margin: 6px 0;
-        font-size: 12px;
-        color: #374151;
+        gap: 5px;
+        margin: 4px 0;
+        font-size: 11px;
+        color: #334155;
         cursor: pointer;
       }
       #${PANEL_ID} .bh-actions {
         display: grid;
-        grid-template-columns: 1.4fr 1fr 1fr;
+        grid-template-columns: 1.3fr 1fr 1fr;
         gap: 6px;
-        margin: 10px 0 8px 0;
+        margin: 4px 0 6px 0;
       }
       #${PANEL_ID} .bh-btn-main {
         border: none;
         border-radius: 6px;
-        padding: 8px 0;
+        padding: 7px 0;
         color: #ffffff;
         font-weight: 600;
         cursor: pointer;
-        font-size: 12px;
+        font-size: 11px;
         transition: opacity 0.2s;
+        text-align: center;
       }
       #${PANEL_ID} .bh-btn-main:hover { opacity: 0.9; }
       #${PANEL_ID} .bh-btn-start { background: #0d9488; }
@@ -1334,53 +1761,144 @@
         background: #f0fdfa;
         border: 1px solid #99f6e4;
         border-radius: 6px;
-        padding: 6px 8px;
-        font-size: 12px;
+        padding: 5px 8px;
+        font-size: 11px;
         color: #0f766e;
-        margin-top: 6px;
-        word-break: break-all;
+        margin: 4px 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       #${PANEL_ID} .bh-stats-box {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        background: #f9fafb;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
         border-radius: 6px;
-        padding: 6px 8px;
-        font-size: 11px;
-        color: #4b5563;
-        margin-top: 6px;
+        padding: 4px 8px;
+        font-size: 10px;
+        color: #475569;
+        margin: 2px 0 4px 0;
         font-weight: 500;
       }
       #${PANEL_ID} .bh-stats-box span b { color: #0d9488; }
+      #${PANEL_ID} .bh-tabs-nav {
+        display: flex;
+        gap: 3px;
+        margin: 4px 0;
+        border-bottom: 1px solid #e2e8f0;
+        padding-bottom: 4px;
+      }
+      #${PANEL_ID} .bh-tab-btn {
+        border: none;
+        background: transparent;
+        color: #64748b;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 4px 6px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.15s;
+        flex: 1;
+        text-align: center;
+      }
+      #${PANEL_ID} .bh-tab-btn:hover {
+        background: #f1f5f9;
+        color: #0f172a;
+      }
+      #${PANEL_ID} .bh-tab-btn.active {
+        background: #0d9488;
+        color: #ffffff;
+      }
+      #${PANEL_ID} .bh-tab-content {
+        max-height: 260px;
+        overflow-y: auto;
+        padding-right: 3px;
+        padding-top: 4px;
+      }
+      #${PANEL_ID} .bh-tab-content::-webkit-scrollbar, #${PANEL_ID} .bh-logs::-webkit-scrollbar {
+        width: 4px;
+      }
+      #${PANEL_ID} .bh-tab-content::-webkit-scrollbar-thumb, #${PANEL_ID} .bh-logs::-webkit-scrollbar-thumb {
+        background: #cbd5e1;
+        border-radius: 4px;
+      }
       #${PANEL_ID} .bh-extra-tools {
         display: flex;
         justify-content: flex-end;
         gap: 6px;
-        margin-top: 4px;
+        margin-top: 6px;
       }
       #${PANEL_ID} .bh-btn-link {
         border: none;
         background: transparent;
-        color: #6b7280;
+        color: #64748b;
         cursor: pointer;
-        font-size: 11px;
+        font-size: 10px;
         text-decoration: underline;
         padding: 0;
       }
       #${PANEL_ID} .bh-btn-link:hover { color: #0f766e; }
       #${PANEL_ID} .bh-logs {
-        max-height: 115px;
+        max-height: 200px;
+        min-height: 120px;
         overflow-y: auto;
-        background: #111827;
-        color: #a7f3d0;
-        font-family: "Consolas", monospace;
-        font-size: 11px;
+        background: #0f172a;
+        color: #34d399;
+        font-family: Consolas, monospace;
+        font-size: 10px;
+        line-height: 1.4;
         padding: 6px 8px;
         border-radius: 6px;
-        margin-top: 8px;
         white-space: pre-wrap;
         user-select: text;
+      }
+      .bh-jev-card-badge {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        vertical-align: middle;
+        line-height: 1.35;
+      }
+      .bh-badge-s {
+        background: #dcfce7 !important;
+        color: #15803d !important;
+        border: 1px solid #86efac !important;
+      }
+      .bh-badge-a {
+        background: #e0f2fe !important;
+        color: #0369a1 !important;
+        border: 1px solid #7dd3fc !important;
+      }
+      .bh-badge-b {
+        background: #fef3c7 !important;
+        color: #b45309 !important;
+        border: 1px solid #fde68a !important;
+      }
+      .bh-badge-reject {
+        background: #fee2e2 !important;
+        color: #b91c1c !important;
+        border: 1px solid #fca5a5 !important;
+      }
+      .bh-jev-box {
+        margin: 4px 0 6px 0;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+      }
+      .bh-jev-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 11px;
+        font-weight: 700;
+        color: #15803d;
+        margin-bottom: 5px;
       }
     `;
     document.head.appendChild(style);
@@ -1440,7 +1958,7 @@
     panel.innerHTML = `
       <div class="bh-header" title="可按住此栏拖拽移动面板">
         <div class="bh-title">
-          <span>BOSS 低频求职助手</span>
+          <span>🧬 BOSS 智能求职助手</span>
           <span class="bh-badge" data-role="status-badge">空闲</span>
         </div>
         <div class="bh-header-tools">
@@ -1449,66 +1967,7 @@
         </div>
       </div>
       <div class="bh-body">
-        <div class="bh-row">
-          <div class="bh-col">
-            <label>安全投递间隔(秒): 最小 ~ 最大</label>
-            <div style="display:flex;gap:4px;align-items:center;">
-              <input data-role="interval-min" type="number" min="20" max="300" style="width:52px;" title="单次投递最小随机间隔">
-              <span>~</span>
-              <input data-role="interval-max" type="number" min="20" max="600" style="width:52px;" title="单次投递最大随机间隔">
-            </div>
-          </div>
-          <div class="bh-col">
-            <label>每日上限 / 最低月薪</label>
-            <div style="display:flex;gap:4px;align-items:center;">
-              <input data-role="daily-max" type="number" min="1" max="150" style="width:50px;" title="每日低频适度上限">
-              <span>人</span>
-              <input data-role="min-salary" type="number" min="0" max="100" step="0.5" style="width:50px;" title="最低月薪(K)，0 表示不限">
-              <span>K</span>
-            </div>
-          </div>
-        </div>
-
-        <label class="bh-checkbox-row">
-          <input data-role="exclude-interns" type="checkbox">
-          <span>自动排除实习岗位 (只投正式全职岗位)</span>
-        </label>
-
-        <div style="display:flex;gap:4px;margin:6px 0 8px 0;align-items:center;">
-          <span style="font-size:11px;color:#4b5563;font-weight:600;white-space:nowrap;">方向预设:</span>
-          <select data-role="preset-select" style="flex:1;min-width:0;" title="选择方向后点击【应用】，一键填充关键词、排除词、招呼语与最低薪资"></select>
-          <button type="button" class="bh-btn-tool" data-action="apply-preset" style="background:#ccfbf1;color:#0f766e;font-weight:600;white-space:nowrap;" title="用所选方向覆盖当前关键词与招呼语">应用</button>
-        </div>
-
-        <label>包含关键词 (任一命中即可；英文短词如 AI/QA 按整词匹配；<b>留空 = 不限方向</b>):</label>
-        <textarea data-role="include-keywords" rows="2" placeholder="例如: Java, 后端, 前端, 算法, 数据分析..."></textarea>
-
-        <label>排除关键词 (命中任一即跳过，可按需删改):</label>
-        <textarea data-role="exclude-keywords" rows="2" placeholder="例如: 销售, 电销, 客服, 普工, 兼职..."></textarea>
-
-        <label class="bh-checkbox-row" title="BOSS 会自动发送你在平台设置的默认招呼语；只有页面弹出可编辑输入框时，才会额外填入并发送下面这段介绍">
-          <input data-role="auto-greeting" type="checkbox">
-          <span>弹出输入框时自动发送求职介绍 (平台默认招呼语仍会先发)</span>
-        </label>
-        <textarea data-role="greeting-text" rows="3" placeholder="求职介绍语，可用占位符 {title} / {company} 自动替换为当前岗位与公司名"></textarea>
-
-        <div style="font-size:11px;color:#475569;margin:6px 0;background:#f0fdfa;padding:6px 8px;border-radius:6px;border-left:3px solid #0d9488;line-height:1.45;">
-          💡 <b>交换简历指南</b>：平台打招呼仅开启会话。每天完成自动打招呼后，请前往【消息】列表向已读 HR 主动点击<b>【发简历】</b>递送 PDF 附件，才能大幅促成简历交换！
-        </div>
-
-        <!-- 当前选中岗位直投与企业邮箱侦测 (方案A) -->
-        <div style="margin:8px 0;padding:8px 10px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;">
-          <div style="font-size:11px;color:#0f766e;font-weight:600;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
-            <span>🎯 目标公司直投/侦测:</span>
-            <span data-role="hunter-company" style="color:#1e293b;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:normal;" title="点击卡片可切换目标">点击卡片选中</span>
-          </div>
-          <div style="display:flex;gap:4px;flex-wrap:wrap;">
-            <button type="button" class="bh-btn-tool" data-action="hunt-wechat" style="background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;" title="在搜狗微信中查找该公司的招聘推文与HR邮箱">🔍 搜公众号推文</button>
-            <button type="button" class="bh-btn-tool" data-action="hunt-aiqicha" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;" title="直达爱企查查询工商登记邮箱与官网">🏢 查爱企查/官网</button>
-            <button type="button" class="bh-btn-tool" data-action="hunt-mailto" style="background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;" title="唤起本地邮件客户端直接发信">✉️ 邮件直投</button>
-          </div>
-        </div>
-
+        <!-- 顶部常驻控制区 -->
         <div class="bh-actions">
           <button class="bh-btn-main bh-btn-start" data-action="start">▶ 开始低频投递</button>
           <button class="bh-btn-main bh-btn-pause" data-action="pause">⏸ 暂停</button>
@@ -1522,23 +1981,184 @@
           <span>剩余: <b data-role="stat-remain">40</b></span>
         </div>
 
-        <div class="bh-extra-tools">
-          <button class="bh-btn-link" data-action="reset-stats">重置今日统计</button>
-          <span style="color:#d1d5db;">|</span>
-          <button class="bh-btn-link" data-action="clear-visited">清空已阅记录</button>
-          <span style="color:#d1d5db;">|</span>
-          <button class="bh-btn-link" data-action="reset-default-preset" style="color:#0d9488;font-weight:600;">恢复默认预设</button>
-          <span style="color:#d1d5db;">|</span>
-          <button class="bh-btn-link" data-action="export-applied" style="color:#0284c7;font-weight:600;">📋 导出/复制已投公司名单</button>
+        <div class="bh-status-box" data-role="message">低频助手已就绪，点击【开始低频投递】</div>
+
+        <!-- 4 分区分页导航栏 -->
+        <div class="bh-tabs-nav">
+          <button type="button" class="bh-tab-btn active" data-tab="jev">🧠 Jev研判</button>
+          <button type="button" class="bh-tab-btn" data-tab="rules">📋 规则配置</button>
+          <button type="button" class="bh-tab-btn" data-tab="hunter">🎯 目标直投</button>
+          <button type="button" class="bh-tab-btn" data-tab="logs">📜 运行日志</button>
         </div>
 
-        <div class="bh-status-box" data-role="message">低频助手已就绪，点击【开始低频投递】</div>
-        <div class="bh-logs" data-role="logs"></div>
+        <!-- Tab 1: Jev 智能多维研判 -->
+        <div class="bh-tab-content" data-tab-content="jev">
+          <div class="bh-jev-box">
+            <div class="bh-jev-header">
+              <span>🧠 Jev 决策模型 (TypeSafe / OpenRouter)</span>
+              <label style="font-size:11px;cursor:pointer;display:flex;align-items:center;gap:3px;font-weight:normal;">
+                <input data-role="jev-enabled" type="checkbox"> 开启研判
+              </label>
+            </div>
+            <div style="margin-bottom:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+                <label style="font-size:10px;color:#166534;font-weight:600;margin:0;">Jev API 密钥:</label>
+                <div style="display:flex;gap:4px;">
+                  <button type="button" class="bh-btn-tool" data-action="toggle-jev-key-view" style="padding:1px 5px;font-size:10px;" title="查看/隐藏明文">👁️</button>
+                  <button type="button" class="bh-btn-tool" data-action="test-jev-key" style="padding:1px 6px;font-size:10px;background:#bbf7d0;color:#14532d;font-weight:600;" title="测试密钥有效性">⚡ 测试连接</button>
+                </div>
+              </div>
+              <input data-role="jev-api-key" type="password" placeholder="输入密钥启用深度研判 (留空则降级为纯规则)" style="width:100%;font-size:11px;padding:4px 6px;">
+            </div>
+            <div style="margin-bottom:6px;">
+              <label style="font-size:10px;color:#166534;font-weight:600;">真实学术/科研画像与排斥要求 (Jev 锚点):</label>
+              <textarea data-role="candidate-profile" rows="4" placeholder="写清：学历与毕业年份、真正做过的技术（越具体越好）、目标岗位；另起一行写『绝对排除：…』列出不想要的岗位类型" style="width:100%;font-size:11px;padding:4px 6px;"></textarea>
+            </div>
+            <div class="bh-row" style="margin:4px 0;">
+              <div class="bh-col">
+                <label style="font-size:10px;color:#166534;">最低研发深度 (0~2):</label>
+                <input data-role="jev-min-depth" type="number" min="0" max="2" step="0.1" style="width:100%;font-size:11px;padding:3px 5px;" title="低于此分的打杂/清洗/低端岗位直接淘汰">
+              </div>
+              <div class="bh-col">
+                <label style="font-size:10px;color:#166534;">陷阱可疑阈值 (0~1):</label>
+                <input data-role="jev-max-trap" type="number" min="0.1" max="0.9" step="0.05" style="width:100%;font-size:11px;padding:3px 5px;" title="派遣/收费培训/伪销售/触犯排除项任一概率高于此值转人工复核（不投也不拒）；达到 0.7 直接拒">
+              </div>
+            </div>
+            <div style="margin:4px 0;">
+              <label style="font-size:10px;color:#166534;">自动投递最低等级:</label>
+              <select data-role="jev-min-tier" style="width:100%;font-size:11px;padding:3px 5px;" title="通过研判但低于此等级的岗位记为备选，可在决策记录里手动处理">
+                <option value="S">仅 S 级（直接对口且研发深度高）</option>
+                <option value="A">S + A 级（直接对口，推荐）</option>
+                <option value="B">S + A + B 级（含相近可转的专业）</option>
+              </select>
+            </div>
+            <label class="bh-checkbox-row" style="font-size:11px;color:#166534;margin:4px 0 0 0;">
+              <input data-role="jev-dry-run" type="checkbox">
+              <span>🧪 校准模式：只研判、打标记，不点沟通、不占额度</span>
+            </label>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">
+              <span style="font-size:10px;color:#64748b;">🟡待复核 / 🔹备选 不会自动投递</span>
+              <button type="button" class="bh-btn-tool" data-action="show-jev-decisions" style="background:#dcfce7;color:#14532d;font-weight:600;" title="查看每个岗位的 Jev 分数、结论与链接，可导出 JSON">📊 决策记录</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 2: 规则与词库配置 -->
+        <div class="bh-tab-content" data-tab-content="rules" style="display:none;">
+          <div style="display:flex;gap:4px;margin:2px 0 6px 0;align-items:center;flex-wrap:wrap;">
+            <span style="font-size:11px;color:#4b5563;font-weight:600;">方向预设:</span>
+            <button type="button" class="bh-btn-tool" data-preset="bio_rd" style="background:#ccfbf1;color:#0f766e;font-weight:600;" title="分子生物、合成生物、重组蛋白纯化、多肽、噬菌体、抗体">🧬 生物研发(推荐)</button>
+            <button type="button" class="bh-btn-tool" data-preset="bioinfo_ai" title="生信分析、AI科研助理、计算生物、Python">💻 生信/AI计算</button>
+            <button type="button" class="bh-btn-tool" data-preset="qc_analysis" title="分析检测、理化质检、仪器分析">🧪 质检/分析</button>
+          </div>
+
+          <label>包含关键词 (任一命中即可；英文短词如 AI/QA 按整词匹配):</label>
+          <textarea data-role="include-keywords" rows="2" placeholder="分子生物, 合成生物, 重组蛋白, 蛋白纯化, 噬菌体, 抗体, 多肽..."></textarea>
+
+          <label style="margin-top:5px;">排除关键词 (命中任一即跳过，已排除纯销售/电销/流水线):</label>
+          <textarea data-role="exclude-keywords" rows="2" placeholder="销售, 电销, 客服, 招商, 普工..."></textarea>
+
+          <div class="bh-row" style="margin-top:6px;">
+            <div class="bh-col">
+              <label>安全投递间隔(秒):</label>
+              <div style="display:flex;gap:4px;align-items:center;">
+                <input data-role="interval-min" type="number" min="20" max="300" style="width:48px;" title="单次投递最小随机间隔">
+                <span>~</span>
+                <input data-role="interval-max" type="number" min="20" max="600" style="width:48px;" title="单次投递最大随机间隔">
+              </div>
+            </div>
+            <div class="bh-col">
+              <label>每日上限 / 最低月薪:</label>
+              <div style="display:flex;gap:4px;align-items:center;">
+                <input data-role="daily-max" type="number" min="1" max="150" style="width:46px;" title="每日低频适度上限">
+                <span>人</span>
+                <input data-role="min-salary" type="number" min="0" max="100" step="0.5" style="width:46px;" title="最低月薪(K)，0 表示不限">
+                <span>K</span>
+              </div>
+            </div>
+          </div>
+
+          <label class="bh-checkbox-row" style="margin-top:6px;">
+            <input data-role="exclude-interns" type="checkbox">
+            <span>自动排除实习岗位 (只投正式全职/应届研发)</span>
+          </label>
+          <div style="display:flex;align-items:center;gap:4px;margin:4px 0;font-size:11px;color:#334155;">
+            <span>经验要求 ≥</span>
+            <input data-role="max-exp-years" type="number" min="0" max="20" style="width:42px;" title="卡片标签要求的最低经验年限达到此值就跳过，例如 3 表示跳过 3-5年、5-10年 的岗位；0 表示不限">
+            <span>年的岗位跳过 (0=不限)</span>
+          </div>
+          <label class="bh-checkbox-row">
+            <input data-role="skip-phd" type="checkbox">
+            <span>跳过要求博士学历的岗位</span>
+          </label>
+
+          <div class="bh-extra-tools" style="margin-top:8px;">
+            <button class="bh-btn-link" data-action="reset-stats">重置今日统计</button>
+            <span style="color:#d1d5db;">|</span>
+            <button class="bh-btn-link" data-action="clear-visited">清空已阅记录</button>
+            <span style="color:#d1d5db;">|</span>
+            <button class="bh-btn-link" data-action="load-bio-preset" style="color:#0d9488;font-weight:600;">恢复预设</button>
+          </div>
+        </div>
+
+        <!-- Tab 3: 目标直投/企业侦测 -->
+        <div class="bh-tab-content" data-tab-content="hunter" style="display:none;">
+          <div style="padding:8px 10px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;margin-bottom:8px;">
+            <div style="font-size:11px;color:#0f766e;font-weight:600;margin-bottom:5px;display:flex;justify-content:space-between;align-items:center;">
+              <span>🎯 目标公司直投/侦测:</span>
+              <span data-role="hunter-company" style="color:#1e293b;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:normal;" title="点击卡片可切换目标">点击卡片选中</span>
+            </div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;">
+              <button type="button" class="bh-btn-tool" data-action="hunt-wechat" style="background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;" title="在搜狗微信中查找该公司的招聘推文与HR邮箱">🔍 搜公众号推文</button>
+              <button type="button" class="bh-btn-tool" data-action="hunt-aiqicha" style="background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;" title="直达爱企查查询工商登记邮箱与官网">🏢 查爱企查/官网</button>
+              <button type="button" class="bh-btn-tool" data-action="hunt-mailto" style="background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;" title="唤起本地邮件客户端直接发信">✉️ 邮件直投</button>
+            </div>
+          </div>
+
+          <div style="font-size:11px;color:#475569;margin-bottom:8px;background:#f0fdfa;padding:8px 10px;border-radius:8px;border-left:3px solid #0d9488;line-height:1.45;">
+            💡 <b>交换简历指南</b>：BOSS平台打招呼仅开启会话。每天完成自动打招呼后，请前往【消息】列表向已读HR主动点击<b>【发简历】</b>递送PDF附件，才能大幅促成简历交换！
+          </div>
+
+          <div style="display:flex;justify-content:flex-end;">
+            <button class="bh-btn-tool" data-action="export-applied" style="background:#0284c7;color:#ffffff;font-weight:600;padding:6px 12px;border:none;" title="导出公司名单直接导入Python脚本">📋 导出/复制名单 (NAS/本地通用)</button>
+          </div>
+        </div>
+
+        <!-- Tab 4: 运行终端日志 -->
+        <div class="bh-tab-content" data-tab-content="logs" style="display:none;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <span style="font-size:11px;color:#64748b;font-weight:600;">实时巡视与决策流水:</span>
+            <button type="button" class="bh-btn-link" data-action="clear-logs" style="font-size:10px;">清空日志</button>
+          </div>
+          <div class="bh-logs" data-role="logs"></div>
+        </div>
       </div>
     `;
 
     restorePanelPosition(panel);
     setupDraggable(panel);
+
+    function switchTab(tabKey) {
+      panel.querySelectorAll(".bh-tab-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.getAttribute("data-tab") === tabKey);
+      });
+      panel.querySelectorAll(".bh-tab-content").forEach(content => {
+        content.style.display = content.getAttribute("data-tab-content") === tabKey ? "block" : "none";
+      });
+      saveSettings({ activeTab: tabKey });
+    }
+
+    panel.querySelectorAll(".bh-tab-btn").forEach(btn => {
+      btn.addEventListener("click", () => switchTab(btn.getAttribute("data-tab")));
+    });
+
+    switchTab(state.settings.activeTab || "jev");
+
+    panel.querySelector('[data-action="clear-logs"]')?.addEventListener("click", () => {
+      state.logs = [];
+      storeSet(STORAGE_KEYS.logs, []);
+      renderStatus();
+    });
 
     panel.querySelector('[data-action="collapse"]').addEventListener("click", () => {
       saveSettings({ panelCollapsed: !state.settings.panelCollapsed });
@@ -1553,43 +2173,34 @@
       panel.remove();
     });
 
-    // 方向预设下拉框（新增预设后会自动出现，无需改这里）
-    const presetSelect = panel.querySelector('[data-role="preset-select"]');
-    presetSelect.innerHTML = Object.entries(PRESETS)
-      .map(([key, p]) => `<option value="${key}">${p.name}</option>`)
-      .join("");
-    presetSelect.value = state.settings.presetKey;
+    panel.querySelectorAll("[data-preset]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const key = btn.getAttribute("data-preset");
+        const p = PRESETS[key];
+        if (!p) return;
+        saveSettings({
+          candidateProfile: p.candidateProfile || state.settings.candidateProfile,
+          includeKeywords: p.includeKeywords,
+          excludeKeywords: p.excludeKeywords,
+          greetingText: p.greetingText,
+          minSalaryK: p.minSalaryK,
+          jevMinDepth: p.jevMinDepth
+        });
+        addLog(`已载入【${p.name}】专属学术画像、关键词与配置！`);
+      });
+    });
 
-    // 应用预设：覆盖关键词 / 排除词 / 招呼语 / 最低薪资
-    function applyPreset(key, silent) {
-      const p = PRESETS[key];
-      if (!p) return;
-      if (!silent && state.settings.includeKeywords && state.settings.includeKeywords !== p.includeKeywords) {
-        if (!confirm(`将用【${p.name}】覆盖当前的关键词、排除词与招呼语，确定继续吗？`)) return;
-      }
+    panel.querySelector('[data-action="load-bio-preset"]').addEventListener("click", () => {
+      const p = PRESETS.bio_rd;
       saveSettings({
-        presetKey: key,
+        candidateProfile: p.candidateProfile || state.settings.candidateProfile,
         includeKeywords: p.includeKeywords,
         excludeKeywords: p.excludeKeywords,
         greetingText: p.greetingText,
-        minSalaryK: p.minSalaryK
+        minSalaryK: p.minSalaryK,
+        jevMinDepth: p.jevMinDepth
       });
-      presetSelect.value = key;
-      addLog(`已载入【${p.name}】预设（关键词 / 排除词 / 招呼语 / 最低薪资）`);
-    }
-
-    presetSelect.addEventListener("change", () => {
-      const p = PRESETS[presetSelect.value];
-      if (p) addLog(`已选择方向【${p.name}】，点击右侧【应用】生效`);
-    });
-
-    panel.querySelector('[data-action="apply-preset"]').addEventListener("click", () => {
-      applyPreset(presetSelect.value, false);
-    });
-
-    panel.querySelector('[data-action="reset-default-preset"]').addEventListener("click", () => {
-      if (!confirm("确定恢复默认预设吗？当前关键词与招呼语会被覆盖。")) return;
-      applyPreset(DEFAULT_PRESET_KEY, true);
+      addLog("已恢复【生物研发】专属科研画像与配置！");
     });
 
     panel.querySelector('[data-action="hunt-wechat"]').addEventListener("click", () => {
@@ -1616,13 +2227,13 @@
 
     panel.querySelector('[data-action="hunt-mailto"]').addEventListener("click", () => {
       const comp = state.currentCompany;
-      const title = state.currentTitle || "应聘岗位";
+      const title = state.currentTitle || "研发岗位";
       if (!comp) {
         alert("请先在页面中点击任意职位卡片以选定目标公司！");
         return;
       }
       const subject = `【应聘-${title}】个人简历`;
-      const body = renderGreeting(state.settings.greetingText);
+      const body = state.settings.greetingText;
       window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
       addLog(`✉️ 已唤起邮件客户端准备直投【${comp} · ${title}】`);
     });
@@ -1631,10 +2242,74 @@
       showAppliedCompaniesModal();
     });
 
-    panel.querySelector('[data-action="start"]').addEventListener("click", () => {
+    panel.querySelector('[data-action="show-jev-decisions"]').addEventListener("click", () => {
+      showJevDecisionsModal();
+    });
+
+    panel.querySelector('[data-action="toggle-jev-key-view"]').addEventListener("click", () => {
+      const input = panel.querySelector('[data-role="jev-api-key"]');
+      if (!input) return;
+      const isPwd = input.type === "password";
+      input.type = isPwd ? "text" : "password";
+      panel.querySelector('[data-action="toggle-jev-key-view"]').textContent = isPwd ? "🙈" : "👁️";
+    });
+
+    panel.querySelector('[data-action="test-jev-key"]').addEventListener("click", async () => {
       savePanelValues();
-      if (state.isRunning) return;
-      if (state.stats.success >= state.settings.dailyMax) {
+      const key = getActiveJevKey();
+      if (!key) {
+        alert("请先在输入框中填入 Jev API Key！\n\n支持：\n1. TypeSafe 官方 Key (直连端点)\n2. OpenRouter Key (sk-or-...)");
+        return;
+      }
+      const testBtn = panel.querySelector('[data-action="test-jev-key"]');
+      const originalText = testBtn.textContent;
+      testBtn.textContent = "⏳ 探测中...";
+      testBtn.disabled = true;
+      try {
+        const data = await requestJevAPI({
+          state: { probe: "testing connection and authentication" },
+          questions: {
+            is_valid: {
+              type: "noul",
+              instructions: "Is this connection test request received successfully?"
+            }
+          }
+        });
+        if (typeof data.answers.is_valid?.noul === "number") {
+          const provider = key.startsWith("sk-or-") ? "OpenRouter" : "TypeSafe 官方";
+          addLog(`✅ Jev API 校验成功！接入节点：${provider}，应答模型 ${data.model || "未知"}`);
+          alert(`✅ Jev API Key 验证成功！
+
+接入节点：${provider}
+应答模型：${data.model || "未知"}
+
+建议先勾选【校准模式】跑一轮，抽查决策记录后再正式投递。`);
+        } else {
+          addLog("⚠️ Jev 返回格式不完整，但网络已联通。");
+          alert("⚠️ Jev 返回格式不完整，请检查模型节点状态。");
+        }
+      } catch (err) {
+        addLog(`❌ Jev 连接测试失败：${err.message}`);
+        alert(`❌ Jev API 连接测试失败：\n${err.message}\n\n请检查：\n1. Key 是否完整且无多余空格\n2. 账户额度/Balance 是否充足\n3. 网络是否可访问 TypeSafe/OpenRouter API`);
+      } finally {
+        testBtn.textContent = originalText;
+        testBtn.disabled = false;
+      }
+    });
+
+    panel.querySelector('[data-action="start"]').addEventListener("click", () => {
+      try {
+        savePanelValues();
+      } catch (err) {
+        console.error("保存面板设置异常:", err);
+      }
+      if (state.mode === "RUNNING") return;
+      state.isRunning = false;
+      if (state.settings.jevEnabled && !getActiveJevKey() &&
+        !confirm("已开启 Jev 研判但没有填写 API Key，本次将只按关键词规则筛选。确定继续吗？")) {
+        return;
+      }
+      if (!state.settings.jevDryRun && state.stats.success >= state.settings.dailyMax) {
         alert("今日已达低频安全上限！如需继续，请调高上限或点击【重置今日统计】。");
         return;
       }
@@ -1644,12 +2319,14 @@
     panel.querySelector('[data-action="pause"]').addEventListener("click", () => {
       if (state.mode !== "RUNNING") return;
       state.mode = "PAUSED";
+      state.isRunning = false;
       setMessage("已暂停投递");
       addLog("已手动暂停低频投递");
     });
 
     panel.querySelector('[data-action="stop"]').addEventListener("click", () => {
       state.mode = "STOPPED";
+      state.isRunning = false;
       setMessage("已停止投递");
       addLog("已手动停止投递");
     });
@@ -1668,7 +2345,7 @@
       addLog("已清空已阅岗位缓存记录");
     });
 
-    panel.querySelectorAll("input, textarea").forEach(input => input.addEventListener("change", savePanelValues));
+    panel.querySelectorAll("input, textarea, select").forEach(input => input.addEventListener("change", savePanelValues));
 
     document.body.appendChild(panel);
     syncInputsFromSettings(true);
@@ -1679,16 +2356,35 @@
     const p = document.getElementById(PANEL_ID);
     if (!p) return;
     const field = role => p.querySelector(`[data-role="${role}"]`);
+    const val = (role, fallback) => {
+      const el = field(role);
+      return el ? el.value : fallback;
+    };
+    const bool = (role, fallback) => {
+      const el = field(role);
+      return el ? el.checked : fallback;
+    };
+
     saveSettings({
-      intervalMin: field("interval-min").value,
-      intervalMax: field("interval-max").value,
-      dailyMax: field("daily-max").value,
-      minSalaryK: field("min-salary").value,
-      excludeInternships: field("exclude-interns").checked,
-      autoSendGreeting: field("auto-greeting").checked,
-      includeKeywords: field("include-keywords").value,
-      excludeKeywords: field("exclude-keywords").value,
-      greetingText: field("greeting-text").value
+      intervalMin: val("interval-min", state.settings.intervalMin),
+      intervalMax: val("interval-max", state.settings.intervalMax),
+      dailyMax: val("daily-max", state.settings.dailyMax),
+      minSalaryK: val("min-salary", state.settings.minSalaryK),
+      excludeInternships: bool("exclude-interns", state.settings.excludeInternships),
+      autoSendGreeting: bool("auto-greeting", state.settings.autoSendGreeting),
+      includeKeywords: val("include-keywords", state.settings.includeKeywords),
+      excludeKeywords: val("exclude-keywords", state.settings.excludeKeywords),
+      greetingText: val("greeting-text", state.settings.greetingText),
+      // Jev 智能设置
+      jevEnabled: bool("jev-enabled", state.settings.jevEnabled),
+      jevApiKey: val("jev-api-key", state.settings.jevApiKey),
+      candidateProfile: val("candidate-profile", state.settings.candidateProfile),
+      jevMinDepth: val("jev-min-depth", state.settings.jevMinDepth),
+      jevMaxTrap: val("jev-max-trap", state.settings.jevMaxTrap),
+      jevMinTier: val("jev-min-tier", state.settings.jevMinTier),
+      jevDryRun: bool("jev-dry-run", state.settings.jevDryRun),
+      maxExpYears: val("max-exp-years", state.settings.maxExpYears),
+      skipPhdJobs: bool("skip-phd", state.settings.skipPhdJobs)
     });
     syncInputsFromSettings(true); // 把规整后的值（如被钳位的间隔）回显到输入框
   }
@@ -1707,7 +2403,16 @@
       ["auto-greeting", "checked", s.autoSendGreeting],
       ["include-keywords", "value", s.includeKeywords],
       ["exclude-keywords", "value", s.excludeKeywords],
-      ["greeting-text", "value", s.greetingText]
+      ["greeting-text", "value", s.greetingText],
+      ["jev-enabled", "checked", s.jevEnabled],
+      ["jev-api-key", "value", s.jevApiKey],
+      ["candidate-profile", "value", s.candidateProfile],
+      ["jev-min-depth", "value", s.jevMinDepth],
+      ["jev-max-trap", "value", s.jevMaxTrap],
+      ["jev-min-tier", "value", s.jevMinTier],
+      ["jev-dry-run", "checked", s.jevDryRun],
+      ["max-exp-years", "value", s.maxExpYears],
+      ["skip-phd", "checked", s.skipPhdJobs]
     ];
     for (const [role, prop, value] of fields) {
       const el = p.querySelector(`[data-role="${role}"]`);
@@ -1725,31 +2430,42 @@
     const p = document.getElementById(PANEL_ID);
     if (!p) return;
 
-    p.classList.toggle("is-collapsed", state.settings.panelCollapsed);
-    p.querySelector('[data-action="collapse"]').textContent = state.settings.panelCollapsed ? "展开" : "收起";
-    p.querySelector('[data-role="status-badge"]').textContent = STATUS_LABELS[state.mode] || state.mode;
+    if (p.classList) p.classList.toggle("is-collapsed", Boolean(state.settings.panelCollapsed));
+    const collapseBtn = p.querySelector('[data-action="collapse"]');
+    if (collapseBtn) collapseBtn.textContent = state.settings.panelCollapsed ? "展开" : "收起";
+    const statusBadge = p.querySelector('[data-role="status-badge"]');
+    if (statusBadge) statusBadge.textContent = STATUS_LABELS[state.mode] || state.mode;
 
     const startBtn = p.querySelector('[data-action="start"]');
-    if (state.mode === "PAUSED") {
-      startBtn.textContent = "▶ 继续投递";
-      startBtn.style.opacity = "1";
-    } else if (state.mode === "RUNNING") {
-      startBtn.textContent = "● 运行中";
-      startBtn.style.opacity = "0.7";
-    } else {
-      startBtn.textContent = "▶ 开始低频投递";
-      startBtn.style.opacity = "1";
+    if (startBtn) {
+      if (state.mode === "PAUSED") {
+        startBtn.textContent = "▶ 继续投递";
+        startBtn.style.opacity = "1";
+      } else if (state.mode === "RUNNING") {
+        startBtn.textContent = "● 运行中";
+        startBtn.style.opacity = "0.7";
+      } else {
+        startBtn.textContent = state.settings.jevDryRun ? "▶ 开始校准研判" : "▶ 开始低频投递";
+        startBtn.style.opacity = "1";
+      }
     }
 
-    p.querySelector('[data-role="stat-success"]').textContent = state.stats.success;
-    p.querySelector('[data-role="stat-skipped"]').textContent = state.stats.skipped;
-    p.querySelector('[data-role="stat-failed"]').textContent = state.stats.failed;
-    p.querySelector('[data-role="stat-remain"]').textContent = Math.max(0, state.settings.dailyMax - state.stats.success);
+    const setText = (role, val) => {
+      const el = p.querySelector(`[data-role="${role}"]`);
+      if (el) el.textContent = val;
+    };
 
-    p.querySelector('[data-role="message"]').textContent = state.currentMessage;
+    setText("stat-success", state.stats.success);
+    setText("stat-skipped", state.stats.skipped);
+    setText("stat-failed", state.stats.failed);
+    setText("stat-remain", Math.max(0, state.settings.dailyMax - state.stats.success));
+    setText("message", state.currentMessage);
+
     const logBox = p.querySelector('[data-role="logs"]');
-    logBox.textContent = state.logs.slice(-12).join("\n");
-    logBox.scrollTop = logBox.scrollHeight;
+    if (logBox) {
+      logBox.textContent = state.logs.slice(-12).join("\n");
+      logBox.scrollTop = logBox.scrollHeight;
+    }
   }
 
   // ========================== 初始化入口 ==========================
